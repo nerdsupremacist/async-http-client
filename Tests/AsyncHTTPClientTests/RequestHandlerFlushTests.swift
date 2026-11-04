@@ -21,12 +21,7 @@ import Testing
 
 @testable import AsyncHTTPClient
 
-struct RequestHandlerFlushTests {
-    enum Handler: CaseIterable {
-        case http1
-        case http2
-    }
-
+@Suite struct RequestHandlerFlushTests {
     @Test(arguments: Handler.allCases)
     func knownLengthBodyIsFlushedOnce(handler: Handler) throws {
         let flushCounter = FlushCountingHandler()
@@ -35,9 +30,7 @@ struct RequestHandlerFlushTests {
 
         channel.write(request, promise: nil)
 
-        withKnownIssue("the head, body and end are each flushed") {
-            #expect(flushCounter.flushCount == 1)
-        }
+        #expect(flushCounter.flushCount == 1)
         #expect(try channel.readOutbound(as: HTTPClientRequestPart.self) == .head(request.requestHead))
         #expect(try channel.readOutbound(as: HTTPClientRequestPart.self) == .body(.byteBuffer(.helloWorld)))
         #expect(try channel.readOutbound(as: HTTPClientRequestPart.self) == .end(nil))
@@ -75,6 +68,61 @@ struct RequestHandlerFlushTests {
         #expect(flushCounter.flushCount == 1)
     }
 
+    @Test(arguments: Handler.allCases)
+    func synchronouslyStreamedBodyIsOnlyHeldBackForItsFirstPart(handler: Handler) throws {
+        let flushCounter = FlushCountingHandler()
+        let (channel, executor) = try EmbeddedChannel.makeConnected(handler, after: [flushCounter])
+        let request = MockHTTPExecutableRequest(
+            head: .init(version: .http1_1, method: .POST, uri: "/", headers: ["host": "localhost"]),
+            framingMetadata: RequestFramingMetadata(connectionClose: false, body: .stream),
+            raiseErrorIfUnimplementedMethodIsCalled: false
+        )
+        request.resumeRequestBodyStreamCallback = {
+            for _ in 0..<3 {
+                executor.writeRequestBodyPart(.byteBuffer(.helloWorld), request: request, promise: nil)
+            }
+            executor.finishRequestBodyStream(trailers: nil, request: request, promise: nil)
+        }
+
+        channel.write(request, promise: nil)
+
+        // The head and the first part are flushed when the second part arrives. From then on every part and the end
+        // are flushed as they are written, so a synchronous producer still sees backpressure.
+        #expect(flushCounter.flushCount == 4)
+    }
+
+    @Test(arguments: Handler.allCases)
+    func bodyIsDeferredWhenWritingTheHeadMakesTheChannelUnwritable(handler: Handler) throws {
+        let flushCounter = FlushCountingHandler()
+        let (channel, executor) = try EmbeddedChannel.makeConnected(
+            handler,
+            after: [flushCounter, LoseWritabilityOnHeadHandler(regainsOnFlush: false)]
+        )
+        let request = MockHTTPExecutableRequest.knownLengthPost(writingThrough: executor)
+
+        channel.write(request, promise: nil)
+
+        #expect(request.events.map(\.kind) == [.willExecuteRequest, .requestHeadSent])
+        #expect(flushCounter.flushCount == 1)
+        #expect(try channel.readOutbound(as: HTTPClientRequestPart.self) == .head(request.requestHead))
+        #expect(try channel.readOutbound(as: HTTPClientRequestPart.self) == nil)
+    }
+
+    @Test(arguments: Handler.allCases)
+    func bodyResumedFromWithinTheFlushIsFlushed(handler: Handler) throws {
+        let (channel, executor) = try EmbeddedChannel.makeConnected(
+            handler,
+            after: [LoseWritabilityOnHeadHandler(regainsOnFlush: true)]
+        )
+        let request = MockHTTPExecutableRequest.knownLengthPost(writingThrough: executor)
+
+        channel.write(request, promise: nil)
+
+        #expect(try channel.readOutbound(as: HTTPClientRequestPart.self) == .head(request.requestHead))
+        #expect(try channel.readOutbound(as: HTTPClientRequestPart.self) == .body(.byteBuffer(.helloWorld)))
+        #expect(try channel.readOutbound(as: HTTPClientRequestPart.self) == .end(nil))
+    }
+
     @Test func http2KnownLengthBodyIsSentAsHeadersAndOneDataFrame() throws {
         let (channel, executor) = try EmbeddedChannel.makeConnected(
             .http2,
@@ -94,11 +142,15 @@ struct RequestHandlerFlushTests {
             return
         }
         #expect(data.data == .byteBuffer(.helloWorld))
-        let trailingFrame = try channel.readOutbound(as: HTTP2Frame.FramePayload.self)
-        withKnownIssue("END_STREAM goes out in a separate, empty DATA frame") {
-            #expect(data.endStream)
-            #expect(trailingFrame == nil)
-        }
+        #expect(data.endStream)
+        #expect(try channel.readOutbound(as: HTTP2Frame.FramePayload.self) == nil)
+    }
+}
+
+extension RequestHandlerFlushTests {
+    enum Handler: CaseIterable {
+        case http1
+        case http2
     }
 }
 
@@ -113,15 +165,49 @@ private final class FlushCountingHandler: ChannelOutboundHandler {
     }
 }
 
+/// Makes the channel non-writable when the request head is written, as a large head does on a real channel, and
+/// optionally writable again once it is flushed.
+private final class LoseWritabilityOnHeadHandler: ChannelOutboundHandler {
+    typealias OutboundIn = HTTPClientRequestPart
+
+    private let regainsOnFlush: Bool
+
+    init(regainsOnFlush: Bool) {
+        self.regainsOnFlush = regainsOnFlush
+    }
+
+    func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        let isHead: Bool
+        if case .head = self.unwrapOutboundIn(data) {
+            isHead = true
+        } else {
+            isHead = false
+        }
+        context.write(data, promise: promise)
+        if isHead {
+            (context.channel as! EmbeddedChannel).isWritable = false
+            context.fireChannelWritabilityChanged()
+        }
+    }
+
+    func flush(context: ChannelHandlerContext) {
+        context.flush()
+        if self.regainsOnFlush, !context.channel.isWritable {
+            (context.channel as! EmbeddedChannel).isWritable = true
+            context.fireChannelWritabilityChanged()
+        }
+    }
+}
+
 extension EmbeddedChannel {
     /// A connected channel whose last handler is the request handler, behind `handlers`.
     fileprivate static func makeConnected(
         _ handler: RequestHandlerFlushTests.Handler,
         after handlers: [any ChannelHandler]
-    ) throws -> (EmbeddedChannel, HTTPRequestExecutor) {
+    ) throws -> (EmbeddedChannel, any HTTPRequestExecutor) {
         let eventLoop = EmbeddedEventLoop()
         let requestHandler: any ChannelHandler
-        let executor: HTTPRequestExecutor
+        let executor: any HTTPRequestExecutor
         switch handler {
         case .http1:
             let http1Handler = HTTP1ClientChannelHandler(
@@ -145,7 +231,9 @@ extension EmbeddedChannel {
 extension MockHTTPExecutableRequest {
     /// A POST whose body is written and finished as soon as the handler resumes the body stream, the way
     /// `Transaction` writes `.byteBuffer` and `.sequence` bodies.
-    fileprivate static func knownLengthPost(writingThrough executor: HTTPRequestExecutor) -> MockHTTPExecutableRequest {
+    fileprivate static func knownLengthPost(
+        writingThrough executor: any HTTPRequestExecutor
+    ) -> MockHTTPExecutableRequest {
         let request = MockHTTPExecutableRequest(
             head: .init(version: .http1_1, method: .POST, uri: "/", headers: ["host": "localhost"]),
             framingMetadata: RequestFramingMetadata(

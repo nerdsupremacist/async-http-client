@@ -568,13 +568,18 @@ class HTTP2ClientRequestHandlerTests: XCTestCase {
         )
         try channel.connect(to: .init(ipAddress: "127.0.0.1", port: 80)).wait()
 
-        // non empty body is important to trigger this bug as we otherwise finish the request in a single flush
+        // a non-empty body is important: without one the head and end are sent together and nothing waits
         let request = MockHTTPExecutableRequest(
             framingMetadata: RequestFramingMetadata(connectionClose: false, body: .fixedSize(1)),
             raiseErrorIfUnimplementedMethodIsCalled: false
         )
         channel.writeAndFlush(request, promise: nil)
-        XCTAssertEqual(request.events.map(\.kind), [.willExecuteRequest, .requestHeadSent])
+        // The head is flushed together with the body, so the body stream is resumed before the flush makes the
+        // channel non-writable, and paused by it.
+        XCTAssertEqual(
+            request.events.map(\.kind),
+            [.willExecuteRequest, .requestHeadSent, .resumeRequestBodyStream, .pauseRequestBodyStream]
+        )
     }
 
     func testSendingAndReceivingTrailers() async throws {
