@@ -36,6 +36,7 @@ struct TracingSupport {
         _ request: HTTPClientRequest,
         configuration: HTTPClient.TracingConfiguration
     ) {
+        guard span.isRecording else { return }
         let requestBodySize: Int? =
             switch request.body?.mode {
             case .asyncSequence(.known(let length), _), .sequence(.known(let length), _, _):
@@ -93,6 +94,7 @@ struct TracingSupport {
         requestBodySize: Int?,
         configuration: HTTPClient.TracingConfiguration
     ) {
+        guard span.isRecording else { return }
         let keys = configuration.attributeKeys
         span.attributes[keys.requestMethod] = requestMethod
         span.attributes[keys.urlScheme] = deconstructedURL?.scheme.rawValue
@@ -110,6 +112,7 @@ struct TracingSupport {
         _ status: HTTPResponseStatus,
         keys: HTTPClient.TracingConfiguration.AttributeKeys
     ) {
+        guard span.isRecording else { return }
         if status.code >= 400 {
             span.setStatus(.init(code: .error))
         }
