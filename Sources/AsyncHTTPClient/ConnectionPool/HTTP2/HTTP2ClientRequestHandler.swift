@@ -57,6 +57,11 @@ final class HTTP2ClientRequestHandler: ChannelDuplexHandler {
     private var idleWriteTimeoutStateMachine: IdleWriteStateMachine?
     private var idleWriteTimeoutTimer: Scheduled<Void>?
 
+    // Set while `sendRequestHead` writes a request with a body. Body parts and the end written synchronously from
+    // within it, as known-length bodies are, are flushed together with the head. A synchronous producer is still
+    // paused at the high watermark: the channel becomes unwritable when writes are buffered, not when they are flushed.
+    private var isBatchingWrites = false
+
     /// Cancelling a task in NIO does *not* guarantee that the task will not execute under certain race conditions.
     /// We therefore give each timer an ID and increase the ID every time we reset or cancel it.
     /// We check in the task if the timer ID has changed in the meantime and do not execute any action if has changed.
@@ -194,7 +199,8 @@ final class HTTP2ClientRequestHandler: ChannelDuplexHandler {
             self.request!.pauseRequestBodyStream()
 
         case .sendBodyPart(let data, let writePromise):
-            context.writeAndFlush(self.wrapOutboundOut(.body(data)), promise: writePromise)
+            context.write(self.wrapOutboundOut(.body(data)), promise: writePromise)
+            self.flushUnlessBatchingWrites(context: context)
 
         case .sendRequestEnd(let trailers, let writePromise, let finalAction):
             let promise = writePromise ?? context.eventLoop.makePromise(of: Void.self)
@@ -205,7 +211,8 @@ final class HTTP2ClientRequestHandler: ChannelDuplexHandler {
                 request.requestBodyStreamSent()
             }
 
-            context.writeAndFlush(self.wrapOutboundOut(.end(trailers)), promise: promise)
+            context.write(self.wrapOutboundOut(.end(trailers)), promise: promise)
+            self.flushUnlessBatchingWrites(context: context)
 
             if let readTimeoutAction = self.idleReadTimeoutStateMachine?.requestEndSent() {
                 self.runTimeoutAction(readTimeoutAction, context: context)
@@ -275,10 +282,23 @@ final class HTTP2ClientRequestHandler: ChannelDuplexHandler {
             context.write(self.wrapOutboundOut(.head(head)), promise: nil)
             context.write(self.wrapOutboundOut(.end(nil)), promise: nil)
             context.flush()
+            self.run(self.state.headSent(), context: context)
         } else {
-            context.writeAndFlush(self.wrapOutboundOut(.head(head)), promise: nil)
+            context.write(self.wrapOutboundOut(.head(head)), promise: nil)
+            self.isBatchingWrites = true
+            self.run(self.state.headSent(), context: context)
+            // End the batch before flushing, so that writes triggered from within the flush, for example by a
+            // writability change resuming the body stream, flush on their own. The flush is needed even if the
+            // request failed in the meantime: it drains the HTTP/2 codec's cached frame and fails that frame's promise.
+            self.isBatchingWrites = false
+            context.flush()
         }
-        self.run(self.state.headSent(), context: context)
+    }
+
+    private func flushUnlessBatchingWrites(context: ChannelHandlerContext) {
+        if !self.isBatchingWrites {
+            context.flush()
+        }
     }
 
     private func runSuccessfulFinalAction(
