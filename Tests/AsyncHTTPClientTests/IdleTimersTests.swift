@@ -105,7 +105,25 @@ struct IdleTimersTests {
         await loop.advanceTime(by: .seconds(60))
 
         #expect(receiver.fired.isEmpty)
-        #expect(!timers.isArmed(on: loop))
+        #expect(!timers.__testOnly_isArmed(on: loop))
+        await loop.shutdownGracefully()
+    }
+
+    @Test func shutDownReleasesTheReceiver() async throws {
+        let loop = NIOAsyncTestingEventLoop()
+        var timers = HTTPConnectionPool.IdleTimers(eventLoops: [loop], timeout: .seconds(60))
+        weak var weakReceiver: RecordingReceiver?
+        do {
+            let receiver = RecordingReceiver()
+            weakReceiver = receiver
+            timers.schedule(1, on: loop, receiver: receiver, logger: self.logger)
+        }
+        // The sweeper entry holds the receiver, as it holds the pool.
+        #expect(weakReceiver != nil)
+
+        timers.shutDown()
+
+        #expect(weakReceiver == nil)
         await loop.shutdownGracefully()
     }
 

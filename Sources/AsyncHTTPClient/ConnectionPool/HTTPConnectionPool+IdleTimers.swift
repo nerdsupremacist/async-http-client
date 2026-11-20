@@ -104,7 +104,7 @@ extension HTTPConnectionPool {
             }
         }
 
-        func isArmed(on eventLoop: any EventLoop) -> Bool {
+        func __testOnly_isArmed(on eventLoop: any EventLoop) -> Bool {
             self.sweepers[ObjectIdentifier(eventLoop)]?.isArmed ?? false
         }
     }
