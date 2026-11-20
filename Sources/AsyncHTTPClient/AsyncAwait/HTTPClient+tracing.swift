@@ -22,7 +22,7 @@ extension HTTPClient {
         _ request: HTTPClientRequest,
         _ body: () async throws -> HTTPClientResponse
     ) async rethrows -> HTTPClientResponse {
-        guard let tracer = self.tracer else {
+        guard let tracer = self.tracing.activeTracer else {
             return try await body()
         }
 

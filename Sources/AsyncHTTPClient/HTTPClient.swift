@@ -1132,7 +1132,10 @@ public final class HTTPClient: Sendable {
         @usableFromInline
         @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
         var activeTracer: (any Tracer)? {
-            self.tracer
+            guard let tracer = self._tracer, !(tracer is NoOpTracer) else {
+                return nil
+            }
+            return (tracer as! any Tracer)
         }
 
         // TODO: Open up customization of keys we use?

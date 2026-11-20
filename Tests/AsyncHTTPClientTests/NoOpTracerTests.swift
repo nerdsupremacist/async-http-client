@@ -28,9 +28,7 @@ struct NoOpTracerTests {
         configuration.tracer = NoOpTracer()
 
         #expect(configuration.tracer is NoOpTracer)
-        withKnownIssue("activeTracer still returns NoOpTracer") {
-            #expect(configuration.activeTracer == nil)
-        }
+        #expect(configuration.activeTracer == nil)
     }
 
     @Test func missingTracerIsNotActive() {
@@ -100,9 +98,7 @@ struct NoOpTracerTests {
             return HTTPClientResponse()
         }
 
-        withKnownIssue("withRequestSpan still opens a span for NoOpTracer") {
-            #expect(contextInBody == nil)
-        }
+        #expect(contextInBody == nil)
     }
 
     @Test func requestSpanIsCreatedForRecordingTracer() async {

@@ -68,7 +68,7 @@ extension HTTPClientRequest.Prepared {
 
         var headers = request.headers
         headers.addHostIfNeeded(for: deconstructedURL)
-        if let tracer = tracing?.tracer,
+        if let tracer = tracing?.activeTracer,
             let context = ServiceContext.current
         {
             tracer.inject(context, into: &headers, using: HTTPHeadersInjector.shared)
