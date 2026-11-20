@@ -1128,6 +1128,13 @@ public final class HTTPClient: Sendable {
             }
         }
 
+        /// The tracer requests create spans with, or `nil` when tracing is off, including for `NoOpTracer`.
+        @usableFromInline
+        @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
+        var activeTracer: (any Tracer)? {
+            self.tracer
+        }
+
         // TODO: Open up customization of keys we use?
         /// Configuration for tracing attributes set by the HTTPClient.
         @usableFromInline
