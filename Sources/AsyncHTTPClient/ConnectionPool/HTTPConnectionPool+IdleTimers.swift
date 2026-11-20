@@ -32,22 +32,18 @@ extension HTTPConnectionPool {
     }
 
     /// The pool's connection idle timeouts, as entries on per-loop deadline sweepers. Guarded by the pool's state lock.
+    /// A loop gets its sweeper the first time one of its connections goes idle.
     ///
     /// A timeout that fired may reach the pool after the connection was reused and went idle again; `claim` tells the
     /// current timeout from such a stale one by its generation.
     struct IdleTimers {
         private let timeout: TimeAmount
-        private let sweepers: [ObjectIdentifier: DeadlineSweeper<IdleTimeout>]
+        private var sweepers: [ObjectIdentifier: DeadlineSweeper<IdleTimeout>] = [:]
         private var active: [Connection.ID: Active] = [:]
         private var nextGeneration: UInt64 = 0
 
-        init(eventLoops: some Sequence<any EventLoop>, timeout: TimeAmount) {
+        init(timeout: TimeAmount) {
             self.timeout = timeout
-            var sweepers: [ObjectIdentifier: DeadlineSweeper<IdleTimeout>] = [:]
-            for eventLoop in eventLoops {
-                sweepers[ObjectIdentifier(eventLoop)] = DeadlineSweeper(eventLoop: eventLoop)
-            }
-            self.sweepers = sweepers
         }
 
         mutating func schedule(
@@ -64,24 +60,18 @@ extension HTTPConnectionPool {
                 generation: generation,
                 receiver: receiver
             )
-            let cancellation: Active.Cancellation
-            if let sweeper = self.sweepers[ObjectIdentifier(eventLoop)] {
-                let deadline = eventLoop.now + self.timeout
-                cancellation = .swept(sweeper, sweeper.insert(deadline: deadline, target: timeout, logger: logger))
-            } else {
-                // A loop the group didn't list in `makeIterator()`.
-                cancellation = .task(eventLoop.scheduleTask(in: self.timeout) { timeout.deadlineExceeded() })
-            }
+            let sweeper = self.sweeper(for: eventLoop)
+            let entryID = sweeper.insert(deadline: eventLoop.now + self.timeout, target: timeout, logger: logger)
 
             assert(self.active[connectionID] == nil)
-            self.active[connectionID] = Active(generation: generation, cancellation: cancellation)
+            self.active[connectionID] = Active(generation: generation, sweeper: sweeper, entryID: entryID)
         }
 
         mutating func cancel(_ connectionID: Connection.ID) {
             guard let active = self.active.removeValue(forKey: connectionID) else {
                 preconditionFailure("Expected to have an idle timer for connection \(connectionID) at this point.")
             }
-            active.cancel()
+            active.sweeper.remove(active.entryID)
         }
 
         /// Returns whether `timeout` is the connection's current idle timeout, and if so, forgets it.
@@ -96,7 +86,7 @@ extension HTTPConnectionPool {
         /// Drops every timeout, so no sweeper entry keeps the pool alive, and leaves nothing armed on a shared loop.
         mutating func shutDown() {
             for active in self.active.values {
-                active.cancel()
+                active.sweeper.remove(active.entryID)
             }
             self.active.removeAll()
             for sweeper in self.sweepers.values {
@@ -107,24 +97,24 @@ extension HTTPConnectionPool {
         func __testOnly_isArmed(on eventLoop: any EventLoop) -> Bool {
             self.sweepers[ObjectIdentifier(eventLoop)]?.isArmed ?? false
         }
+
+        private mutating func sweeper(for eventLoop: any EventLoop) -> DeadlineSweeper<IdleTimeout> {
+            let key = ObjectIdentifier(eventLoop)
+            if let sweeper = self.sweepers[key] {
+                return sweeper
+            }
+            // The sweeper holds the loop, so its identifier isn't reused while the entry exists.
+            let sweeper = DeadlineSweeper<IdleTimeout>(eventLoop: eventLoop)
+            self.sweepers[key] = sweeper
+            return sweeper
+        }
     }
 }
 
 extension HTTPConnectionPool.IdleTimers {
     private struct Active {
-        enum Cancellation {
-            case swept(DeadlineSweeper<HTTPConnectionPool.IdleTimeout>, DeadlineSweeper<HTTPConnectionPool.IdleTimeout>.EntryID)
-            case task(Scheduled<Void>)
-        }
-
         var generation: UInt64
-        var cancellation: Cancellation
-
-        func cancel() {
-            switch self.cancellation {
-            case .swept(let sweeper, let id): sweeper.remove(id)
-            case .task(let task): task.cancel()
-            }
-        }
+        var sweeper: DeadlineSweeper<HTTPConnectionPool.IdleTimeout>
+        var entryID: DeadlineSweeper<HTTPConnectionPool.IdleTimeout>.EntryID
     }
 }

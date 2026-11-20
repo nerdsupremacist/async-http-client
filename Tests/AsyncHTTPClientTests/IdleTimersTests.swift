@@ -27,7 +27,7 @@ struct IdleTimersTests {
     @Test func firesAfterTheTimeoutAndIsClaimedOnce() async throws {
         let loop = NIOAsyncTestingEventLoop()
         let receiver = RecordingReceiver()
-        var timers = HTTPConnectionPool.IdleTimers(eventLoops: [loop], timeout: .seconds(60))
+        var timers = HTTPConnectionPool.IdleTimers(timeout: .seconds(60))
 
         timers.schedule(1, on: loop, receiver: receiver, logger: self.logger)
         await loop.advanceTime(by: .seconds(60))
@@ -45,7 +45,7 @@ struct IdleTimersTests {
     @Test func aCancelledTimerDoesNotFire() async throws {
         let loop = NIOAsyncTestingEventLoop()
         let receiver = RecordingReceiver()
-        var timers = HTTPConnectionPool.IdleTimers(eventLoops: [loop], timeout: .seconds(60))
+        var timers = HTTPConnectionPool.IdleTimers(timeout: .seconds(60))
 
         timers.schedule(1, on: loop, receiver: receiver, logger: self.logger)
         await loop.advanceTime(by: .seconds(30))
@@ -59,7 +59,7 @@ struct IdleTimersTests {
     @Test func aReusedConnectionTimesOutAtItsSecondIdleDeadline() async throws {
         let loop = NIOAsyncTestingEventLoop()
         let receiver = RecordingReceiver()
-        var timers = HTTPConnectionPool.IdleTimers(eventLoops: [loop], timeout: .seconds(60))
+        var timers = HTTPConnectionPool.IdleTimers(timeout: .seconds(60))
 
         timers.schedule(1, on: loop, receiver: receiver, logger: self.logger)
         await loop.advanceTime(by: .seconds(30))
@@ -76,7 +76,7 @@ struct IdleTimersTests {
     @Test func aFireThatLostTheRaceToAReuseIsNotClaimed() async throws {
         let loop = NIOAsyncTestingEventLoop()
         let receiver = RecordingReceiver()
-        var timers = HTTPConnectionPool.IdleTimers(eventLoops: [loop], timeout: .seconds(60))
+        var timers = HTTPConnectionPool.IdleTimers(timeout: .seconds(60))
 
         timers.schedule(1, on: loop, receiver: receiver, logger: self.logger)
         await loop.advanceTime(by: .seconds(60))
@@ -98,7 +98,7 @@ struct IdleTimersTests {
     @Test func shutDownLeavesNothingArmed() async throws {
         let loop = NIOAsyncTestingEventLoop()
         let receiver = RecordingReceiver()
-        var timers = HTTPConnectionPool.IdleTimers(eventLoops: [loop], timeout: .seconds(60))
+        var timers = HTTPConnectionPool.IdleTimers(timeout: .seconds(60))
 
         timers.schedule(1, on: loop, receiver: receiver, logger: self.logger)
         timers.shutDown()
@@ -111,7 +111,7 @@ struct IdleTimersTests {
 
     @Test func shutDownReleasesTheReceiver() async throws {
         let loop = NIOAsyncTestingEventLoop()
-        var timers = HTTPConnectionPool.IdleTimers(eventLoops: [loop], timeout: .seconds(60))
+        var timers = HTTPConnectionPool.IdleTimers(timeout: .seconds(60))
         weak var weakReceiver: RecordingReceiver?
         do {
             let receiver = RecordingReceiver()
@@ -127,20 +127,24 @@ struct IdleTimersTests {
         await loop.shutdownGracefully()
     }
 
-    @Test func aLoopWithoutASweeperStillTimesOut() async throws {
-        let listed = NIOAsyncTestingEventLoop()
-        let unlisted = NIOAsyncTestingEventLoop()
+    @Test func eachLoopTimesOutOnItsOwnSweeper() async throws {
+        let first = NIOAsyncTestingEventLoop()
+        let second = NIOAsyncTestingEventLoop()
         let receiver = RecordingReceiver()
-        var timers = HTTPConnectionPool.IdleTimers(eventLoops: [listed], timeout: .seconds(60))
+        var timers = HTTPConnectionPool.IdleTimers(timeout: .seconds(60))
+        #expect(!timers.__testOnly_isArmed(on: first))
 
-        timers.schedule(1, on: unlisted, receiver: receiver, logger: self.logger)
-        await unlisted.advanceTime(by: .seconds(60))
+        timers.schedule(1, on: first, receiver: receiver, logger: self.logger)
+        timers.schedule(2, on: second, receiver: receiver, logger: self.logger)
+        #expect(timers.__testOnly_isArmed(on: first))
+        #expect(timers.__testOnly_isArmed(on: second))
+        await first.advanceTime(by: .seconds(60))
 
-        let fired = try #require(receiver.fired.first)
-        let claimed = timers.claim(fired)
-        #expect(claimed)
-        await listed.shutdownGracefully()
-        await unlisted.shutdownGracefully()
+        #expect(receiver.fired.map(\.connectionID) == [1])
+        await second.advanceTime(by: .seconds(60))
+        #expect(receiver.fired.map(\.connectionID) == [1, 2])
+        await first.shutdownGracefully()
+        await second.shutdownGracefully()
     }
 }
 

@@ -70,10 +70,7 @@ final class HTTPConnectionPool:
         logger[metadataKey: "ahc-pool-key"] = "\(key)"
         self.logger = logger
 
-        self._idleTimers = IdleTimers(
-            eventLoops: eventLoopGroup.makeIterator(),
-            timeout: clientConfiguration.connectionPool.idleTimeout
-        )
+        self._idleTimers = IdleTimers(timeout: clientConfiguration.connectionPool.idleTimeout)
 
         self._state = StateMachine(
             idGenerator: idGenerator,
