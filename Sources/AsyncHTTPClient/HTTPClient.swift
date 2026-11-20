@@ -73,6 +73,7 @@ public final class HTTPClient: Sendable {
     /// All HTTP transactions will occur on loops owned by this group.
     public let eventLoopGroup: EventLoopGroup
     let poolManager: HTTPConnectionPool.Manager
+    let deadlineSweepers: [ObjectIdentifier: DeadlineSweeper<TransactionCancelHandler>]
 
     @usableFromInline
     let configuration: Configuration
@@ -189,6 +190,11 @@ public final class HTTPClient: Sendable {
             configuration: self.configuration,
             backgroundActivityLogger: backgroundActivityLogger
         )
+        var deadlineSweepers: [ObjectIdentifier: DeadlineSweeper<TransactionCancelHandler>] = [:]
+        for eventLoop in eventLoopGroup.makeIterator() {
+            deadlineSweepers[ObjectIdentifier(eventLoop)] = DeadlineSweeper(eventLoop: eventLoop)
+        }
+        self.deadlineSweepers = deadlineSweepers
         self.state = NIOLockedValueBox(.upAndRunning)
         self.fileIOThreadPool = NIOLockedValueBox(nil)
     }
@@ -341,6 +347,10 @@ public final class HTTPClient: Sendable {
         let promise = self.eventLoopGroup.any().makePromise(of: Bool.self)
         self.poolManager.shutdown(promise: promise)
         promise.futureResult.whenComplete { result in
+            // The pool has failed every request, so no deadline needs the timers any more.
+            for sweeper in self.deadlineSweepers.values {
+                sweeper.shutDown()
+            }
             switch result {
             case .failure:
                 preconditionFailure("Shutting down the connection pool must not fail, ever.")
