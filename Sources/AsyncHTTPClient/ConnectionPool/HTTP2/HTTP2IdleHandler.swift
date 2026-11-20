@@ -36,6 +36,7 @@ final class HTTP2IdleHandler<Delegate: HTTP2IdleHandlerDelegate>: ChannelDuplexH
     let delegate: Delegate
 
     private var state: StateMachine
+    private var context: ChannelHandlerContext?
 
     init(delegate: Delegate, logger: Logger, maximumConnectionUses: Int? = nil) {
         self.state = StateMachine(maximumUses: maximumConnectionUses)
@@ -44,9 +45,30 @@ final class HTTP2IdleHandler<Delegate: HTTP2IdleHandlerDelegate>: ChannelDuplexH
     }
 
     func handlerAdded(context: ChannelHandlerContext) {
+        self.context = context
         if context.channel.isActive {
             self.state.channelActive()
         }
+    }
+
+    func handlerRemoved(context: ChannelHandlerContext) {
+        self.context = nil
+    }
+
+    /// The delegate to pass to `NIOHTTP2Handler`'s inline multiplexer, so this handler can count
+    /// open streams.
+    func streamDelegate(eventLoop: EventLoop) -> StreamDelegate {
+        StreamDelegate(handler: NIOLoopBound(self, eventLoop: eventLoop))
+    }
+
+    func streamCreated() {
+        let action = self.state.streamCreated()
+        self.run(action)
+    }
+
+    func streamClosed() {
+        let action = self.state.streamClosed()
+        self.run(action)
     }
 
     func channelActive(context: ChannelHandlerContext) {
@@ -65,11 +87,11 @@ final class HTTP2IdleHandler<Delegate: HTTP2IdleHandlerDelegate>: ChannelDuplexH
         switch frame.payload {
         case .goAway:
             let action = self.state.goAwayReceived()
-            self.run(action, context: context)
+            self.run(action)
 
         case .settings(.settings(let settings)):
             let action = self.state.settingsReceived(settings)
-            self.run(action, context: context)
+            self.run(action)
 
         default:
             // We're not interested in other events.
@@ -79,38 +101,18 @@ final class HTTP2IdleHandler<Delegate: HTTP2IdleHandlerDelegate>: ChannelDuplexH
         context.fireChannelRead(data)
     }
 
-    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
-        // We intercept calls between the `NIOHTTP2ChannelHandler` and the `HTTP2StreamMultiplexer`
-        // to learn, how many open streams we have.
-        switch event {
-        case is StreamClosedEvent:
-            let action = self.state.streamClosed()
-            self.run(action, context: context)
-
-        case is NIOHTTP2StreamCreatedEvent:
-            let action = self.state.streamCreated()
-            self.run(action, context: context)
-
-        default:
-            // We're not interested in other events.
-            break
-        }
-
-        context.fireUserInboundEventTriggered(event)
-    }
-
     func triggerUserOutboundEvent(context: ChannelHandlerContext, event: Any, promise: EventLoopPromise<Void>?) {
         switch event {
         case HTTPConnectionEvent.shutdownRequested:
             let action = self.state.closeEventReceived()
-            self.run(action, context: context)
+            self.run(action)
 
         default:
             context.triggerUserOutboundEvent(event, promise: promise)
         }
     }
 
-    private func run(_ action: StateMachine.Action, context: ChannelHandlerContext) {
+    private func run(_ action: StateMachine.Action) {
         switch action {
         case .nothing:
             break
@@ -125,7 +127,21 @@ final class HTTP2IdleHandler<Delegate: HTTP2IdleHandlerDelegate>: ChannelDuplexH
             self.delegate.http2GoAwayReceived()
 
         case .close:
-            context.close(mode: .all, promise: nil)
+            self.context?.close(mode: .all, promise: nil)
+        }
+    }
+}
+
+extension HTTP2IdleHandler {
+    struct StreamDelegate: NIOHTTP2StreamDelegate {
+        let handler: NIOLoopBound<HTTP2IdleHandler>
+
+        func streamCreated(_ id: HTTP2StreamID, channel: Channel) {
+            self.handler.value.streamCreated()
+        }
+
+        func streamClosed(_ id: HTTP2StreamID, channel: Channel) {
+            self.handler.value.streamClosed()
         }
     }
 }
