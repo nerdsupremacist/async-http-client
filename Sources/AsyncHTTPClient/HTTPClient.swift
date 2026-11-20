@@ -942,6 +942,9 @@ public final class HTTPClient: Sendable {
         /// A method with access to the HTTP/2 stream channel that is called when creating the stream.
         public var http2StreamChannelDebugInitializer: (@Sendable (Channel) -> EventLoopFuture<Void>)?
 
+        /// Forces how HTTP/2 connections run their streams; `nil` uses the default. Internal, for tests.
+        var _http2StreamMode: HTTP2Connection.StreamMode? = nil
+
         /// Configuration how distributed traces are created and handled.
         public var tracing: TracingConfiguration = .init()
 

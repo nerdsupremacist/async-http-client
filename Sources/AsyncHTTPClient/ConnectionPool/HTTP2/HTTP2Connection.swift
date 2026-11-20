@@ -32,8 +32,36 @@ final class HTTP2Connection {
     internal static let defaultSettings = nioDefaultSettings + [HTTP2Setting(parameter: .enablePush, value: 0)]
 
     let channel: Channel
-    let multiplexer: HTTP2StreamMultiplexer
     let logger: Logger
+
+    /// How the connection runs its streams, decided once per connection.
+    enum StreamMode: Hashable, Sendable {
+        /// A child channel and pipeline per request, via `HTTP2StreamMultiplexer`.
+        case childChannels
+        /// Every request is an entry in one `HTTP2ClientConnectionHandler`.
+        case connectionHandler
+
+        /// Child channels whenever a feature needs a stream `Channel` (the stream debug
+        /// initializer, the decompression handler) or isn't ported yet (idle read/write timeouts).
+        init(configuration: HTTPClient.Configuration) {
+            if configuration.http2StreamChannelDebugInitializer != nil {
+                self = .childChannels
+            } else if case .enabled = configuration.decompression {
+                self = .childChannels
+            } else if configuration.timeout.read != nil || configuration.timeout.write != nil {
+                self = .childChannels
+            } else {
+                self = configuration._http2StreamMode ?? .connectionHandler
+            }
+        }
+    }
+
+    private enum StreamDriver {
+        case childChannels(HTTP2StreamMultiplexer)
+        case connectionHandler(HTTP2ClientConnectionHandler)
+    }
+
+    private let streamDriver: StreamDriver
 
     /// A method with access to the stream channel that is called when creating the stream.
     let streamChannelDebugInitializer: (@Sendable (Channel) -> EventLoopFuture<Void>)?
@@ -99,6 +127,7 @@ final class HTTP2Connection {
         maximumConnectionUses: Int?,
         delegate: HTTP2ConnectionDelegate,
         logger: Logger,
+        streamMode: StreamMode = .childChannels,
         streamChannelDebugInitializer: (@Sendable (Channel) -> EventLoopFuture<Void>)? = nil
     ) {
         self.channel = channel
@@ -106,16 +135,23 @@ final class HTTP2Connection {
         self.decompression = decompression
         self.maximumConnectionUses = maximumConnectionUses
         self.logger = logger
-        self.multiplexer = HTTP2StreamMultiplexer(
-            mode: .client,
-            channel: channel,
-            targetWindowSize: 8 * 1024 * 1024,  // 8mb
-            outboundBufferSizeHighWatermark: 8196,
-            outboundBufferSizeLowWatermark: 4092,
-            inboundStreamInitializer: { channel -> EventLoopFuture<Void> in
-                channel.eventLoop.makeFailedFuture(HTTP2PushNotSupportedError())
-            }
-        )
+        switch streamMode {
+        case .childChannels:
+            self.streamDriver = .childChannels(
+                HTTP2StreamMultiplexer(
+                    mode: .client,
+                    channel: channel,
+                    targetWindowSize: 8 * 1024 * 1024,  // 8mb
+                    outboundBufferSizeHighWatermark: 8196,
+                    outboundBufferSizeLowWatermark: 4092,
+                    inboundStreamInitializer: { channel -> EventLoopFuture<Void> in
+                        channel.eventLoop.makeFailedFuture(HTTP2PushNotSupportedError())
+                    }
+                )
+            )
+        case .connectionHandler:
+            self.streamDriver = .connectionHandler(HTTP2ClientConnectionHandler(eventLoop: channel.eventLoop))
+        }
         self.delegate = delegate
         self.state = .initialized
         self.streamChannelDebugInitializer = streamChannelDebugInitializer
@@ -134,6 +170,7 @@ final class HTTP2Connection {
         decompression: HTTPClient.Decompression,
         maximumConnectionUses: Int?,
         logger: Logger,
+        streamMode: StreamMode = .childChannels,
         streamChannelDebugInitializer: (@Sendable (Channel) -> EventLoopFuture<Void>)? = nil
     ) -> EventLoopFuture<(HTTP2Connection, Int)>.Isolated {
         let connection = HTTP2Connection(
@@ -143,6 +180,7 @@ final class HTTP2Connection {
             maximumConnectionUses: maximumConnectionUses,
             delegate: delegate,
             logger: logger,
+            streamMode: streamMode,
             streamChannelDebugInitializer: streamChannelDebugInitializer
         )
 
@@ -229,15 +267,31 @@ final class HTTP2Connection {
             let sync = self.channel.pipeline.syncOperations
 
             let http2Handler = NIOHTTP2Handler(mode: .client, initialSettings: Self.defaultSettings)
+            let maximumUses: Int?
+            switch self.streamDriver {
+            case .childChannels:
+                maximumUses = self.maximumConnectionUses
+            case .connectionHandler:
+                // Retire the connection before odd stream IDs run out.
+                maximumUses = min(
+                    self.maximumConnectionUses ?? .max,
+                    HTTP2ClientConnectionHandler.maximumStreamCount
+                )
+            }
             let idleHandler = HTTP2IdleHandler(
                 delegate: self,
                 logger: self.logger,
-                maximumConnectionUses: self.maximumConnectionUses
+                maximumConnectionUses: maximumUses
             )
 
             try sync.addHandler(http2Handler, position: .last)
             try sync.addHandler(idleHandler, position: .last)
-            try sync.addHandler(self.multiplexer, position: .last)
+            switch self.streamDriver {
+            case .childChannels(let multiplexer):
+                try sync.addHandler(multiplexer, position: .last)
+            case .connectionHandler(let handler):
+                try sync.addHandler(handler, position: .last)
+            }
         } catch {
             self.channel.close(mode: .all, promise: nil)
             readyToAcceptConnectionsPromise.fail(error)
@@ -254,10 +308,18 @@ final class HTTP2Connection {
             preconditionFailure("Invalid state: \(self.state). Sending requests is not allowed before we are started.")
 
         case .active:
+            let multiplexer: HTTP2StreamMultiplexer
+            switch self.streamDriver {
+            case .connectionHandler(let handler):
+                handler.executeRequest(request)
+                return
+            case .childChannels(let childMultiplexer):
+                multiplexer = childMultiplexer
+            }
             let createStreamChannelPromise = self.channel.eventLoop.makePromise(of: Channel.self)
             let loopBoundSelf = NIOLoopBound(self, eventLoop: self.channel.eventLoop)
 
-            self.multiplexer.createStreamChannel(
+            multiplexer.createStreamChannel(
                 promise: createStreamChannelPromise
             ) { [streamChannelDebugInitializer] channel -> EventLoopFuture<Void> in
                 let connection = loopBoundSelf.value
@@ -324,8 +386,13 @@ final class HTTP2Connection {
             self.state = .closing
 
             // inform all open streams, that the currently running request should be cancelled.
-            for box in self.openStreams {
-                box.channel.triggerUserOutboundEvent(HTTPConnectionEvent.shutdownRequested, promise: nil)
+            switch self.streamDriver {
+            case .childChannels:
+                for box in self.openStreams {
+                    box.channel.triggerUserOutboundEvent(HTTPConnectionEvent.shutdownRequested, promise: nil)
+                }
+            case .connectionHandler(let handler):
+                handler.cancelAllStreams()
             }
 
             // inform the idle connection handler, that connection should be closed, once all streams
