@@ -31,7 +31,11 @@ extension HTTPConnectionPool {
         private struct State: Sendable {
             var runState: RunState = .active
             var pools: [Key: HTTPConnectionPool] = [:]
+            var pgPools: [Key: any PGH2PoolSpike] = [:]
         }
+
+        // Spike switch: async-API requests to https hosts go to postgres-nio's pool, which only speaks HTTP/2.
+        private static let routeHTTPSThroughPGPool = true
 
         private let eventLoopGroup: EventLoopGroup
         private let configuration: HTTPClient.Configuration
@@ -53,6 +57,13 @@ extension HTTPConnectionPool {
 
         func executeRequest(_ request: HTTPSchedulableRequest) {
             let poolKey = request.poolKey
+            if Self.routeHTTPSThroughPGPool, poolKey.scheme == .https,
+                #available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *),
+                let transaction = request as? Transaction
+            {
+                return self.executeOnPGPool(transaction)
+            }
+
             let poolResult = self.state.withLockedValue { state -> Result<HTTPConnectionPool, HTTPClientError> in
                 switch state.runState {
                 case .active:
@@ -86,6 +97,35 @@ extension HTTPConnectionPool {
             }
         }
 
+        @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+        private func executeOnPGPool(_ transaction: Transaction) {
+            let poolKey = transaction.poolKey
+            let pool = self.state.withLockedValue { state -> (any PGH2PoolSpike)? in
+                guard case .active = state.runState else { return nil }
+                if let pool = state.pgPools[poolKey] {
+                    return pool
+                }
+                let pool = PGH2Pool(
+                    key: poolKey,
+                    tlsConfiguration: transaction.tlsConfiguration,
+                    clientConfiguration: self.configuration,
+                    sslContextCache: self.sslContextCache,
+                    eventLoopGroup: self.eventLoopGroup,
+                    logger: self.logger
+                )
+                state.pgPools[poolKey] = pool
+                return pool
+            }
+            guard let pool else {
+                return transaction.fail(HTTPClientError.alreadyShutdown)
+            }
+            pool.executeRequest(transaction)
+        }
+
+        var __forTesting_pgPoolCount: Int {
+            self.state.withLockedValue { $0.pgPools.count }
+        }
+
         /// Shutdown the connection pool manager. You **must** shutdown the pool manager, since it leak otherwise.
         ///
         /// - Parameter promise: An `EventLoopPromise` that is succeeded once all connections pools are shutdown.
@@ -97,16 +137,25 @@ extension HTTPConnectionPool {
                 case shutdown([Key: HTTPConnectionPool])
             }
 
+            // The PG pools shut down asynchronously; the caller's promise waits for them and for the AHC pools.
+            var pgPools: [any PGH2PoolSpike] = []
+            var poolsPromise = promise
+
             let action = self.state.withLockedValue { state -> ShutdownAction in
                 switch state.runState {
                 case .active:
+                    pgPools = Array(state.pgPools.values)
+                    state.pgPools = [:]
+                    if !pgPools.isEmpty {
+                        poolsPromise = self.eventLoopGroup.any().makePromise(of: Bool.self)
+                    }
                     // If there aren't any pools, we can mark the pool as shut down right away.
                     if state.pools.isEmpty {
                         state.runState = .shutDown
-                        return .done(promise)
+                        return .done(poolsPromise)
                     } else {
                         // this promise will be succeeded once all connection pools are shutdown
-                        state.runState = .shuttingDown(promise: promise, unclean: false)
+                        state.runState = .shuttingDown(promise: poolsPromise, unclean: false)
                         return .shutdown(state.pools)
                     }
 
@@ -124,6 +173,17 @@ extension HTTPConnectionPool {
             case .shutdown(let pools):
                 for pool in pools.values {
                     pool.shutdown()
+                }
+            }
+
+            if let poolsPromise, !pgPools.isEmpty {
+                // Unstructured on purpose: shutdown(promise:) is synchronous and the PG pools stop asynchronously.
+                Task { [pgPools] in
+                    for pool in pgPools {
+                        await pool.shutdown()
+                    }
+                    let unclean = (try? await poolsPromise.futureResult.get()) ?? true
+                    promise?.succeed(unclean)
                 }
             }
         }

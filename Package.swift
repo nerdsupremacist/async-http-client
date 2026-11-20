@@ -57,6 +57,8 @@ let package = Package(
         // Disable all traits to prevent linking Foundation
         .package(url: "https://github.com/apple/swift-configuration.git", from: "1.0.0", traits: []),
         .package(url: "https://github.com/apple/swift-service-context.git", from: "1.1.0"),
+        // Spike: H2 requests through postgres-nio's connection pool (verified source: 1.34.0-beta.1 = 464a137).
+        .package(url: "https://github.com/vapor/postgres-nio.git", exact: "1.34.0-beta.1"),
     ],
     targets: [
         .target(
@@ -91,6 +93,7 @@ let package = Package(
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "Tracing", package: "swift-distributed-tracing"),
                 .product(name: "ServiceContextModule", package: "swift-service-context"),
+                .product(name: "_ConnectionPoolModule", package: "postgres-nio"),
             ],
             swiftSettings: strictConcurrencySettings
         ),
