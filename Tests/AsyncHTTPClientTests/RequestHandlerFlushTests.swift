@@ -32,9 +32,7 @@ import Testing
 
         channel.write(request, promise: nil)
 
-        withKnownIssue("the head, body and end are each flushed") {
-            #expect(eventCounter.flushCalls == 1)
-        }
+        #expect(eventCounter.flushCalls == 1)
         #expect(try channel.readOutbound(as: HTTPClientRequestPart.self) == .head(request.requestHead))
         #expect(try channel.readOutbound(as: HTTPClientRequestPart.self) == .body(.byteBuffer(.helloWorld)))
         #expect(try channel.readOutbound(as: HTTPClientRequestPart.self) == .end(nil))
@@ -93,11 +91,8 @@ import Testing
             return
         }
         #expect(data.data == .byteBuffer(.helloWorld))
-        let trailingFrame = try channel.readOutbound(as: HTTP2Frame.FramePayload.self)
-        withKnownIssue("END_STREAM goes out in a separate, empty DATA frame") {
-            #expect(data.endStream)
-            #expect(trailingFrame == nil)
-        }
+        #expect(data.endStream)
+        #expect(try channel.readOutbound(as: HTTP2Frame.FramePayload.self) == nil)
     }
 }
 

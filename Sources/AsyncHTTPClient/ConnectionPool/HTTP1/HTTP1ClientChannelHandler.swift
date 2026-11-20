@@ -63,6 +63,11 @@ final class HTTP1ClientChannelHandler: ChannelDuplexHandler {
     private var idleWriteTimeoutStateMachine: IdleWriteStateMachine?
     private var idleWriteTimeoutTimer: Scheduled<Void>?
 
+    // Set while `sendRequestHead` writes a request with a body. Body parts and the end written synchronously from
+    // within it, as known-length bodies are, are flushed together with the head. A synchronous producer is still
+    // paused at the high watermark: the channel becomes unwritable when writes are buffered, not when they are flushed.
+    private var isBatchingWrites = false
+
     /// Cancelling a task in NIO does *not* guarantee that the task will not execute under certain race conditions.
     /// We therefore give each timer an ID and increase the ID every time we reset or cancel it.
     /// We check in the task if the timer ID has changed in the meantime and do not execute any action if has changed.
@@ -240,7 +245,8 @@ final class HTTP1ClientChannelHandler: ChannelDuplexHandler {
                 }
             }
         case .sendBodyPart(let part, let writePromise):
-            context.writeAndFlush(self.wrapOutboundOut(.body(part)), promise: writePromise)
+            context.write(self.wrapOutboundOut(.body(part)), promise: writePromise)
+            self.flushUnlessBatchingWrites(context: context)
 
         case .sendRequestEnd(let trailers, let writePromise, let finalAction):
             // We need to defer succeeding the old request to avoid ordering issues
@@ -290,7 +296,7 @@ final class HTTP1ClientChannelHandler: ChannelDuplexHandler {
             }
 
             // We must update the idle timeout state machines before writing the request end. The
-            // write promise may be completed synchronously within `writeAndFlush`. If the final action
+            // write promise may be completed synchronously when the end is flushed. If the final action
             // is `.informConnectionIsIdle`, the pool might then synchronously schedule a new request
             // onto this connection. The idle timeout state machines would then belong to the new
             // request and must not be transitioned on behalf of the old one.
@@ -302,7 +308,8 @@ final class HTTP1ClientChannelHandler: ChannelDuplexHandler {
                 self.runTimeoutAction(writeTimeoutAction, context: context)
             }
 
-            context.writeAndFlush(self.wrapOutboundOut(.end(trailers)), promise: writePromise)
+            context.write(self.wrapOutboundOut(.end(trailers)), promise: writePromise)
+            self.flushUnlessBatchingWrites(context: context)
 
         case .pauseRequestBodyStream:
             // We can force unwrap the request here, as we have just validated in the state machine,
@@ -416,10 +423,23 @@ final class HTTP1ClientChannelHandler: ChannelDuplexHandler {
             context.write(self.wrapOutboundOut(.head(head)), promise: nil)
             context.write(self.wrapOutboundOut(.end(nil)), promise: nil)
             context.flush()
+            self.run(self.state.headSent(), context: context)
         } else {
-            context.writeAndFlush(self.wrapOutboundOut(.head(head)), promise: nil)
+            context.write(self.wrapOutboundOut(.head(head)), promise: nil)
+            self.isBatchingWrites = true
+            self.run(self.state.headSent(), context: context)
+            // End the batch before flushing, so that writes triggered from within the flush, for example by a
+            // writability change resuming the body stream, flush on their own. The flush is needed even if the
+            // request failed in the meantime, so that the pending writes complete or fail.
+            self.isBatchingWrites = false
+            context.flush()
         }
-        self.run(self.state.headSent(), context: context)
+    }
+
+    private func flushUnlessBatchingWrites(context: ChannelHandlerContext) {
+        if !self.isBatchingWrites {
+            context.flush()
+        }
     }
 
     private func runTimeoutAction(_ action: IdleReadStateMachine.Action, context: ChannelHandlerContext) {
