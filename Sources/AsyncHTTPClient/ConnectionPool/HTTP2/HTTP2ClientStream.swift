@@ -16,13 +16,19 @@ import NIOCore
 import NIOHTTP1
 import NIOHTTP2
 
-/// One request on one HTTP/2 stream of an `HTTP2ClientConnectionHandler`.
+/// One request on one HTTP/2 stream of an `HTTP2ClientConnectionHandler`. Event loop only.
 ///
-/// A value in the handler's stream table. Its methods never call out: the handler mutates it in
-/// place, ends the access, and only then talks to the request or the channel.
-struct HTTP2ClientStream {
+/// A reference, not a value: keeping a ~1.4 KB value in the handler's `Dictionary` made every
+/// mutating access run the dictionary's `modify` coroutine, which heap-allocates its frames
+/// (3 mallocs per access, 69 per request on Download512B). Its methods never call out; the handler
+/// changes it, then talks to the request or the channel, then checks `isActive` again.
+final class HTTP2ClientStream {
     let id: HTTP2StreamID
     let request: any HTTPExecutableRequest
+    /// Strong: a late executor call can outlive the pipeline. The cycle breaks on removal.
+    let handler: HTTP2ClientConnectionHandler
+    /// In the handler's table. Cleared when the stream is removed; stale executor calls check it.
+    var isActive = true
     var machine: HTTPRequestStateMachine
     var decoder: HTTP2ClientResponseDecoder
     var inboundWindow: HTTP2InboundWindow
@@ -44,9 +50,16 @@ struct HTTP2ClientStream {
     /// nio-http2 has closed the stream, so it needs no RST_STREAM.
     var closedByNIO = false
 
-    init(id: HTTP2StreamID, request: any HTTPExecutableRequest, parentIsWritable: Bool, targetWindowSize: Int32) {
+    init(
+        id: HTTP2StreamID,
+        request: any HTTPExecutableRequest,
+        handler: HTTP2ClientConnectionHandler,
+        parentIsWritable: Bool,
+        targetWindowSize: Int32
+    ) {
         self.id = id
         self.request = request
+        self.handler = handler
         self.machine = HTTPRequestStateMachine(isChannelWritable: parentIsWritable)
         self.decoder = HTTP2ClientResponseDecoder(requestMethod: request.requestHead.method)
         self.inboundWindow = HTTP2InboundWindow(targetSize: targetWindowSize)
