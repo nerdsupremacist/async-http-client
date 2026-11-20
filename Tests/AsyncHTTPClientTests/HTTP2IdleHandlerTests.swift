@@ -195,12 +195,7 @@ class HTTP2IdleHandlerTests: XCTestCase {
 
         for i in 0..<(1...100).randomElement()! {
             let streamID = HTTP2StreamID(i)
-            let event = NIOHTTP2StreamCreatedEvent(
-                streamID: streamID,
-                localInitialWindowSize: nil,
-                remoteInitialWindowSize: nil
-            )
-            embedded.pipeline.fireUserInboundEventTriggered(event)
+            idleHandler.streamCreated()
             openStreams.insert(streamID)
         }
 
@@ -210,9 +205,8 @@ class HTTP2IdleHandlerTests: XCTestCase {
         while let streamID = openStreams.randomElement() {
             openStreams.remove(streamID)
 
-            let event = StreamClosedEvent(streamID: streamID, reason: nil)
             XCTAssertTrue(embedded.isActive)
-            embedded.pipeline.fireUserInboundEventTriggered(event)
+            idleHandler.streamClosed()
             if openStreams.isEmpty {
                 XCTAssertFalse(embedded.isActive)
             } else {
@@ -239,12 +233,7 @@ class HTTP2IdleHandlerTests: XCTestCase {
 
         for i in 0..<(1...100).randomElement()! {
             let streamID = HTTP2StreamID(i)
-            let event = NIOHTTP2StreamCreatedEvent(
-                streamID: streamID,
-                localInitialWindowSize: nil,
-                remoteInitialWindowSize: nil
-            )
-            embedded.pipeline.fireUserInboundEventTriggered(event)
+            idleHandler.streamCreated()
             openStreams.insert(streamID)
         }
 
@@ -261,9 +250,8 @@ class HTTP2IdleHandlerTests: XCTestCase {
         while let streamID = openStreams.randomElement() {
             openStreams.remove(streamID)
 
-            let event = StreamClosedEvent(streamID: streamID, reason: nil)
             XCTAssertTrue(embedded.isActive)
-            embedded.pipeline.fireUserInboundEventTriggered(event)
+            idleHandler.streamClosed()
             if openStreams.isEmpty {
                 XCTAssertFalse(embedded.isActive)
             } else {
@@ -321,29 +309,18 @@ class HTTP2IdleHandlerTests: XCTestCase {
         XCTAssertNoThrow(try embedded.writeInbound(settingsFrame))
         XCTAssertEqual(delegate.maxStreams, 100)
 
-        for streamID in HTTP2StreamID(1)..<HTTP2StreamID(5) {
-            let event = NIOHTTP2StreamCreatedEvent(
-                streamID: streamID,
-                localInitialWindowSize: nil,
-                remoteInitialWindowSize: nil
-            )
-            embedded.pipeline.fireUserInboundEventTriggered(event)
+        for _ in HTTP2StreamID(1)..<HTTP2StreamID(5) {
+            idleHandler.streamCreated()
             XCTAssertFalse(delegate.goAwayReceived)
         }
 
         // Open one the last stream.
-        let event = NIOHTTP2StreamCreatedEvent(
-            streamID: HTTP2StreamID(5),
-            localInitialWindowSize: nil,
-            remoteInitialWindowSize: nil
-        )
-        embedded.pipeline.fireUserInboundEventTriggered(event)
+        idleHandler.streamCreated()
         XCTAssertTrue(delegate.goAwayReceived)
 
         // Close the streams.
-        for streamID in HTTP2StreamID(1)...HTTP2StreamID(5) {
-            let event = StreamClosedEvent(streamID: streamID, reason: nil)
-            embedded.pipeline.fireUserInboundEventTriggered(event)
+        for _ in HTTP2StreamID(1)...HTTP2StreamID(5) {
+            idleHandler.streamClosed()
         }
 
         // The channel should be closed, but we need to run the event loop for the close future

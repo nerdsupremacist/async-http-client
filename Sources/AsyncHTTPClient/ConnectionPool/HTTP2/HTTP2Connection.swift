@@ -32,7 +32,7 @@ final class HTTP2Connection {
     internal static let defaultSettings = nioDefaultSettings + [HTTP2Setting(parameter: .enablePush, value: 0)]
 
     let channel: Channel
-    let multiplexer: HTTP2StreamMultiplexer
+    private var multiplexer: NIOHTTP2Handler.StreamMultiplexer?
     let logger: Logger
 
     /// A method with access to the stream channel that is called when creating the stream.
@@ -106,16 +106,6 @@ final class HTTP2Connection {
         self.decompression = decompression
         self.maximumConnectionUses = maximumConnectionUses
         self.logger = logger
-        self.multiplexer = HTTP2StreamMultiplexer(
-            mode: .client,
-            channel: channel,
-            targetWindowSize: 8 * 1024 * 1024,  // 8mb
-            outboundBufferSizeHighWatermark: 8196,
-            outboundBufferSizeLowWatermark: 4092,
-            inboundStreamInitializer: { channel -> EventLoopFuture<Void> in
-                channel.eventLoop.makeFailedFuture(HTTP2PushNotSupportedError())
-            }
-        )
         self.delegate = delegate
         self.state = .initialized
         self.streamChannelDebugInitializer = streamChannelDebugInitializer
@@ -221,23 +211,39 @@ final class HTTP2Connection {
         }
 
         do {
-            // We create and add the http handlers ourselves here, since we need to inject an
-            // `HTTP2IdleHandler` between the `NIOHTTP2Handler` and the `HTTP2StreamMultiplexer`.
-            // The purpose of the `HTTP2IdleHandler` is to count open streams in the multiplexer.
-            // We use the HTTP2IdleHandler's information to notify our delegate, whether more work
-            // can be scheduled on this connection.
+            // The `HTTP2IdleHandler` counts open streams (through the inline multiplexer's stream
+            // delegate) and sees the root stream's SETTINGS and GOAWAY frames. We use its
+            // information to tell our delegate whether more work can be scheduled on this connection.
             let sync = self.channel.pipeline.syncOperations
 
-            let http2Handler = NIOHTTP2Handler(mode: .client, initialSettings: Self.defaultSettings)
             let idleHandler = HTTP2IdleHandler(
                 delegate: self,
                 logger: self.logger,
                 maximumConnectionUses: self.maximumConnectionUses
             )
 
+            var connectionConfiguration = NIOHTTP2Handler.ConnectionConfiguration()
+            connectionConfiguration.initialSettings = Self.defaultSettings
+            connectionConfiguration.targetWindowSize = 8 * 1024 * 1024  // 8mb
+            var streamConfiguration = NIOHTTP2Handler.StreamConfiguration()
+            streamConfiguration.targetWindowSize = 8 * 1024 * 1024  // 8mb
+            streamConfiguration.outboundBufferSizeHighWatermark = 8196
+            streamConfiguration.outboundBufferSizeLowWatermark = 4092
+
+            let http2Handler = NIOHTTP2Handler(
+                mode: .client,
+                eventLoop: self.channel.eventLoop,
+                connectionConfiguration: connectionConfiguration,
+                streamConfiguration: streamConfiguration,
+                streamDelegate: idleHandler.streamDelegate(eventLoop: self.channel.eventLoop),
+                inboundStreamInitializer: { channel -> EventLoopFuture<Void> in
+                    channel.eventLoop.makeFailedFuture(HTTP2PushNotSupportedError())
+                }
+            )
+
             try sync.addHandler(http2Handler, position: .last)
             try sync.addHandler(idleHandler, position: .last)
-            try sync.addHandler(self.multiplexer, position: .last)
+            self.multiplexer = try http2Handler.syncMultiplexer()
         } catch {
             self.channel.close(mode: .all, promise: nil)
             readyToAcceptConnectionsPromise.fail(error)
@@ -254,10 +260,12 @@ final class HTTP2Connection {
             preconditionFailure("Invalid state: \(self.state). Sending requests is not allowed before we are started.")
 
         case .active:
+            // The multiplexer is set in `_start0`, before the connection can become active.
+            let multiplexer = self.multiplexer!
             let createStreamChannelPromise = self.channel.eventLoop.makePromise(of: Channel.self)
             let loopBoundSelf = NIOLoopBound(self, eventLoop: self.channel.eventLoop)
 
-            self.multiplexer.createStreamChannel(
+            multiplexer.createStreamChannel(
                 promise: createStreamChannelPromise
             ) { [streamChannelDebugInitializer] channel -> EventLoopFuture<Void> in
                 let connection = loopBoundSelf.value
