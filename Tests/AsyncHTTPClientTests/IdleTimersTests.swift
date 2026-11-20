@@ -32,15 +32,13 @@ struct IdleTimersTests {
         timers.schedule(1, on: loop, receiver: receiver, logger: self.logger)
         await loop.advanceTime(by: .seconds(60))
 
-        withKnownIssue("IdleTimers is a stub") {
-            let fired = try #require(receiver.fired.first)
-            #expect(receiver.fired.count == 1)
-            #expect(fired.connectionID == 1)
-            let first = timers.claim(fired)
-            let second = timers.claim(fired)
-            #expect(first)
-            #expect(!second)
-        }
+        let fired = try #require(receiver.fired.first)
+        #expect(receiver.fired.count == 1)
+        #expect(fired.connectionID == 1)
+        let first = timers.claim(fired)
+        let second = timers.claim(fired)
+        #expect(first)
+        #expect(!second)
         await loop.shutdownGracefully()
     }
 
@@ -71,9 +69,7 @@ struct IdleTimersTests {
         #expect(receiver.fired.isEmpty)
         await loop.advanceTime(by: .seconds(20))
 
-        withKnownIssue("IdleTimers is a stub") {
-            #expect(receiver.fired.count == 1)
-        }
+        #expect(receiver.fired.count == 1)
         await loop.shutdownGracefully()
     }
 
@@ -88,18 +84,14 @@ struct IdleTimersTests {
         timers.cancel(1)
         timers.schedule(1, on: loop, receiver: receiver, logger: self.logger)
 
-        withKnownIssue("IdleTimers is a stub") {
-            let stale = try #require(receiver.fired.first)
-            let claimed = timers.claim(stale)
-            #expect(!claimed)
-        }
+        let stale = try #require(receiver.fired.first)
+        let claimedStale = timers.claim(stale)
+        #expect(!claimedStale)
         await loop.advanceTime(by: .seconds(60))
-        withKnownIssue("IdleTimers is a stub") {
-            let current = try #require(receiver.fired.last)
-            #expect(receiver.fired.count == 2)
-            let claimed = timers.claim(current)
-            #expect(claimed)
-        }
+        let current = try #require(receiver.fired.last)
+        #expect(receiver.fired.count == 2)
+        let claimedCurrent = timers.claim(current)
+        #expect(claimedCurrent)
         await loop.shutdownGracefully()
     }
 
@@ -126,11 +118,9 @@ struct IdleTimersTests {
         timers.schedule(1, on: unlisted, receiver: receiver, logger: self.logger)
         await unlisted.advanceTime(by: .seconds(60))
 
-        withKnownIssue("IdleTimers is a stub") {
-            let fired = try #require(receiver.fired.first)
-            let claimed = timers.claim(fired)
-            #expect(claimed)
-        }
+        let fired = try #require(receiver.fired.first)
+        let claimed = timers.claim(fired)
+        #expect(claimed)
         await listed.shutdownGracefully()
         await unlisted.shutdownGracefully()
     }
