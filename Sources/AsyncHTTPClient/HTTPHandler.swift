@@ -861,11 +861,28 @@ extension HTTPClientResponseDelegate {
 
 extension URL {
     var percentEncodedPath: String {
-        if self.path.isEmpty {
-            return "/"
+        #if canImport(Darwin)
+        guard #available(macOS 13, iOS 16, tvOS 16, watchOS 9, *) else {
+            return self.legacyPercentEncodedPath
         }
-        return URLComponents(url: self, resolvingAgainstBaseURL: true)?.percentEncodedPath ?? self.path
+        // Before the 26 releases, Darwin's `path(percentEncoded:)` ignores `baseURL`:
+        // https://github.com/swiftlang/swift-foundation/issues/1011
+        if #unavailable(macOS 26, iOS 26, tvOS 26, watchOS 26, visionOS 26), self.baseURL != nil {
+            return self.legacyPercentEncodedPath
+        }
+        #endif
+        // Reads the path directly, without the `URLComponents` re-parse that older Darwin needs.
+        let path = self.path(percentEncoded: true)
+        return path.isEmpty ? "/" : path
     }
+
+    #if canImport(Darwin)
+    // Tests the encoded path for emptiness: the decoded `path` is empty for invalid UTF-8 escapes.
+    var legacyPercentEncodedPath: String {
+        let path = URLComponents(url: self, resolvingAgainstBaseURL: true)?.percentEncodedPath ?? self.path
+        return path.isEmpty ? "/" : path
+    }
+    #endif
 
     var uri: String {
         var uri = self.percentEncodedPath

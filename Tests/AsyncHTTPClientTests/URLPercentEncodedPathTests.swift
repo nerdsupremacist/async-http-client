@@ -44,13 +44,6 @@ struct URLPercentEncodedPathTests {
         ("unix:///tmp/socket", "/echo-uri", "/echo-uri"),
     ]
 
-    // Darwin's decoded `path` is empty for invalid UTF-8 escapes, and the emptiness check reads it.
-    #if canImport(Darwin)
-    static let decodedPathDropsInvalidUTF8 = true
-    #else
-    static let decodedPathDropsInvalidUTF8 = false
-    #endif
-
     @Test(arguments: Self.validPaths)
     func validPathsAreKept(url: String, path: String) throws {
         let url = try #require(URL(string: url))
@@ -66,10 +59,27 @@ struct URLPercentEncodedPathTests {
     @Test(arguments: Self.invalidUTF8Paths)
     func invalidUTF8EscapesAreKept(url: String, path: String) throws {
         let url = try #require(URL(string: url))
-        withKnownIssue("Darwin sends `/` for paths whose escapes aren't valid UTF-8") {
-            #expect(url.percentEncodedPath == path)
-        } when: {
-            Self.decodedPathDropsInvalidUTF8
-        }
+        #expect(url.percentEncodedPath == path)
     }
+
+    // Only these tests reach the `URLComponents` fallback on macOS 26 or later; below 26, relative URLs reach it too.
+    #if canImport(Darwin)
+    @Test(arguments: Self.validPaths)
+    func legacyPathMatchesForValidPaths(url: String, path: String) throws {
+        let url = try #require(URL(string: url))
+        #expect(url.legacyPercentEncodedPath == path)
+    }
+
+    @Test(arguments: Self.relativePaths)
+    func legacyPathMatchesForRelativePaths(base: String, relative: String, path: String) throws {
+        let url = try #require(URL(string: relative, relativeTo: URL(string: base)))
+        #expect(url.legacyPercentEncodedPath == path)
+    }
+
+    @Test(arguments: Self.invalidUTF8Paths)
+    func legacyPathMatchesForInvalidUTF8Escapes(url: String, path: String) throws {
+        let url = try #require(URL(string: url))
+        #expect(url.legacyPercentEncodedPath == path)
+    }
+    #endif
 }
