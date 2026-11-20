@@ -64,7 +64,6 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
         self.streams.count
     }
 
-
     func executeRequest(_ request: any HTTPExecutableRequest) {
         self.eventLoop.assertInEventLoop()
         guard self.context != nil, !self.isInactive, self.nextStreamID > 0 else {
@@ -108,7 +107,6 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
             }
         }
     }
-
 
     func handlerAdded(context: ChannelHandlerContext) {
         self.context = context
@@ -159,6 +157,8 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
 
     func channelReadComplete(context: ChannelHandlerContext) {
         self.isReading = false
+        // NIOHTTP2Handler.channelReadComplete already flushed everything written during the burst.
+        self.needsFlush = false
         self.withBatch {
             swap(&self.readScratchIDs, &self.streamsWithPendingReads)
             var index = 0
@@ -251,7 +251,6 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
         context.fireChannelInactive()
     }
 
-
     fileprivate func writeRequestBodyPart0(
         _ data: IOData,
         streamID id: HTTP2StreamID,
@@ -301,7 +300,6 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
         }
     }
 
-
     private func run(_ action: HTTPRequestStateMachine.Action, streamID id: HTTP2StreamID) {
         guard let request = self.streams[id]?.request else {
             // The stream is gone (removed by a nested call out); only promises still need an answer.
@@ -339,8 +337,9 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
 
         case .sendRequestEnd(let trailers, let writePromise, _):
             // The final action is HTTP/1 semantics; an h2 stream ends after every request anyway.
+            // A caller's promise may belong to another event loop, so the callback is Sendable.
             let promise = writePromise ?? self.eventLoop.makePromise(of: Void.self)
-            promise.futureResult.assumeIsolated().whenSuccess {
+            promise.futureResult.whenSuccess {
                 request.requestBodyStreamSent()
             }
             self.sendRequestEnd(trailers, promise: promise, streamID: id)
@@ -385,7 +384,6 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
             self.run(action, streamID: id)
         }
     }
-
 
     private func sendRequestHead(_ head: HTTPRequestHead, sendEnd: Bool, streamID id: HTTP2StreamID) {
         let headers: HPACKHeaders
@@ -486,7 +484,11 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
         switch held.payload {
         case .data(let data):
             let size = data.data.readableBytes
-            let promise = held.promise ?? self.eventLoop.makePromise(of: Void.self)
+            // Our own promise, on our loop: a caller's may belong to another event loop.
+            let promise = self.eventLoop.makePromise(of: Void.self)
+            if let callerPromise = held.promise {
+                promise.futureResult.cascade(to: callerPromise)
+            }
             promise.futureResult.assumeIsolated().whenComplete { _ in
                 if let newValue = self.streams[id]?.writability.bytesWritten(size) {
                     self.withBatch { self.writabilityChanged(id, to: newValue) }
@@ -511,7 +513,6 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
         self.needsFlush = true
         context.write(self.wrapOutboundOut(frame), promise: promise)
     }
-
 
     /// Runs `body`, then (outermost call only) releases held frames in stream order and flushes
     /// once. Inside a parent read burst the flush is left to `NIOHTTP2Handler.channelReadComplete`.
@@ -541,7 +542,6 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
         }
         self.batchDepth -= 1
     }
-
 
     private func read0(_ id: HTTP2StreamID) {
         guard let stream = self.streams[id], !stream.unsatisfiedRead else { return }
@@ -600,7 +600,6 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
             self.run(action, streamID: id)
         }
     }
-
 
     private func streamClosed(_ id: HTTP2StreamID, reason: HTTP2ErrorCode?) {
         guard self.streams[id] != nil else { return }
