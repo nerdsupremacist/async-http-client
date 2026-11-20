@@ -16,7 +16,7 @@ import Logging
 import NIOConcurrencyHelpers
 import NIOCore
 
-protocol DeadlineTarget: AnyObject, Sendable {
+protocol DeadlineTarget: Sendable {
     func deadlineExceeded()
 }
 
