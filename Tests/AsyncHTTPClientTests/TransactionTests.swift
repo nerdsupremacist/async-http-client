@@ -658,7 +658,7 @@ private actor Promise<Value: Sendable> {
 
 @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
 extension Transaction {
-    fileprivate static func makeWithResultTask(
+    static func makeWithResultTask(
         request: sending PreparedRequest,
         requestOptions: RequestOptions = .forTests(),
         logger: Logger = Logger(label: "test"),
