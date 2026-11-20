@@ -23,12 +23,12 @@ protocol HTTPConnectionPoolDelegate {
 
 final class HTTPConnectionPool:
     // TODO: Refactor to use `NIOLockedValueBox` which will allow this to be checked
-    @unchecked Sendable
+    @unchecked Sendable, IdleTimeoutReceiver
 {
     private let stateLock = NIOLock()
     private var _state: StateMachine
     /// The connection idle timeout timers. Protected by the stateLock
-    private var _idleTimer = [Connection.ID: Scheduled<Void>]()
+    private var _idleTimers: IdleTimers
     /// The connection backoff timeout timers. Protected by the stateLock
     private var _backoffTimer = [Connection.ID: Scheduled<Void>]()
     /// The request connection timeout timers. Protected by the stateLock
@@ -43,7 +43,6 @@ final class HTTPConnectionPool:
     private let eventLoopGroup: EventLoopGroup
     private let connectionFactory: ConnectionFactory
     private let clientConfiguration: HTTPClient.Configuration
-    private let idleConnectionTimeout: TimeAmount
 
     let delegate: HTTPConnectionPoolDelegate
 
@@ -71,7 +70,7 @@ final class HTTPConnectionPool:
         logger[metadataKey: "ahc-pool-key"] = "\(key)"
         self.logger = logger
 
-        self.idleConnectionTimeout = clientConfiguration.connectionPool.idleTimeout
+        self._idleTimers = IdleTimers(timeout: clientConfiguration.connectionPool.idleTimeout)
 
         self._state = StateMachine(
             idGenerator: idGenerator,
@@ -305,6 +304,7 @@ final class HTTPConnectionPool:
             connection.close(promise: nil)
 
             if case .yes(let unclean) = isShutdown {
+                self.stateLock.withLock { self._idleTimers.shutDown() }
                 self.delegate.connectionPoolDidShutdown(self, unclean: unclean)
             }
 
@@ -339,6 +339,7 @@ final class HTTPConnectionPool:
             }
 
             if case .yes(let unclean) = isShutdown {
+                self.stateLock.withLock { self._idleTimers.shutDown() }
                 self.delegate.connectionPoolDidShutdown(self, unclean: unclean)
             }
 
@@ -432,20 +433,17 @@ final class HTTPConnectionPool:
                 "ahc-connection-id": "\(connectionID)"
             ]
         )
-        let scheduled = eventLoop.scheduleTask(in: self.idleConnectionTimeout) {
-            // there might be a race between a cancelTimer call and the triggering
-            // of this scheduled task. both want to acquire the lock
-            self.modifyStateAndRunActions { stateMachine in
-                if self._idleTimer.removeValue(forKey: connectionID) != nil {
-                    // The timer still exists. State Machines assumes it is alive
-                    return stateMachine.connectionIdleTimeout(connectionID, on: eventLoop)
-                }
+        self._idleTimers.schedule(connectionID, on: eventLoop, receiver: self, logger: self.logger)
+    }
+
+    func idleTimeoutFired(_ timeout: IdleTimeout) {
+        // The connection may have been reused, and gone idle again, before this fire took the lock.
+        self.modifyStateAndRunActions { stateMachine in
+            guard self._idleTimers.claim(timeout) else {
                 return .none
             }
+            return stateMachine.connectionIdleTimeout(timeout.connectionID, on: timeout.eventLoop)
         }
-
-        assert(self._idleTimer[connectionID] == nil)
-        self._idleTimer[connectionID] = scheduled
     }
 
     private func cancelIdleTimerForConnection(_ connectionID: Connection.ID) {
@@ -455,10 +453,7 @@ final class HTTPConnectionPool:
                 "ahc-connection-id": "\(connectionID)"
             ]
         )
-        guard let cancelTimer = self._idleTimer.removeValue(forKey: connectionID) else {
-            preconditionFailure("Expected to have an idle timer for connection \(connectionID) at this point.")
-        }
-        cancelTimer.cancel()
+        self._idleTimers.cancel(connectionID)
     }
 
     private func scheduleConnectionStartBackoffTimer(

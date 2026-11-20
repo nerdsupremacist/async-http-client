@@ -171,11 +171,15 @@ extension HTTPClient {
         return try await withTaskCancellationHandler(
             operation: { () async throws -> HTTPClientResponse in
                 let eventLoop = self.eventLoopGroup.any()
-                let deadlineTask = eventLoop.scheduleTask(deadline: deadline) {
-                    cancelHandler.cancel(reason: .deadlineExceeded)
-                }
+                let requestDeadline = RequestDeadline.arm(
+                    in: self.deadlineSweepers[ObjectIdentifier(eventLoop)],
+                    on: eventLoop,
+                    at: deadline,
+                    cancelHandler: cancelHandler,
+                    logger: logger
+                )
                 defer {
-                    deadlineTask.cancel()
+                    requestDeadline.cancel()
                 }
                 return try await withCheckedThrowingContinuation {
                     (continuation: CheckedContinuation<HTTPClientResponse, Swift.Error>) -> Void in
@@ -200,11 +204,38 @@ extension HTTPClient {
     }
 }
 
+@available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
+private enum RequestDeadline {
+    case swept(DeadlineSweeper<TransactionCancelHandler>, DeadlineSweeper<TransactionCancelHandler>.EntryID)
+    case task(Scheduled<Void>)
+
+    static func arm(
+        in sweeper: DeadlineSweeper<TransactionCancelHandler>?,
+        on eventLoop: any EventLoop,
+        at deadline: NIODeadline,
+        cancelHandler: TransactionCancelHandler,
+        logger: Logger
+    ) -> Self {
+        guard let sweeper else {
+            // A loop the group didn't list in `makeIterator()`.
+            return .task(eventLoop.scheduleTask(deadline: deadline) { cancelHandler.cancel(reason: .deadlineExceeded) })
+        }
+        return .swept(sweeper, sweeper.insert(deadline: deadline, target: cancelHandler, logger: logger))
+    }
+
+    func cancel() {
+        switch self {
+        case .swept(let sweeper, let id): sweeper.remove(id)
+        case .task(let task): task.cancel()
+        }
+    }
+}
+
 /// There is currently no good way to asynchronously cancel an object that is initiated inside the `body` closure of `with*Continuation`.
 /// As a workaround we use `TransactionCancelHandler` which will take care of the race between instantiation of `Transaction`
 /// in the `body` closure and cancelation from the `onCancel` closure  of `withTaskCancellationHandler`.
 @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
-final class TransactionCancelHandler: Sendable {
+final class TransactionCancelHandler: DeadlineTarget {
     enum CancelReason {
         /// swift concurrency task was canceled
         case taskCanceled
@@ -235,6 +266,10 @@ final class TransactionCancelHandler: Sendable {
         case .cancel(let transaction, let reason):
             Self.cancel(transaction, for: reason)
         }
+    }
+
+    func deadlineExceeded() {
+        self.cancel(reason: .deadlineExceeded)
     }
 
     private static func cancel(_ transaction: Transaction, for reason: CancelReason) {
