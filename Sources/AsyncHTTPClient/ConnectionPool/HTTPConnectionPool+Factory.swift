@@ -106,6 +106,7 @@ extension HTTPConnectionPool.ConnectionFactory {
                     decompression: self.clientConfiguration.decompression,
                     maximumConnectionUses: self.clientConfiguration.maximumUsesPerConnection,
                     logger: logger,
+                    streamMode: HTTP2Connection.StreamMode(configuration: self.clientConfiguration),
                     streamChannelDebugInitializer:
                         self.clientConfiguration.http2StreamChannelDebugInitializer
                 ).whenComplete { result in

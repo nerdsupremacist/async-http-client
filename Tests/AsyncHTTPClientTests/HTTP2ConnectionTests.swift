@@ -414,6 +414,8 @@ final class TestConnectionCreator {
         tlsConfiguration.certificateVerification = .none
         var config = HTTPClient.Configuration()
         config.httpVersion = .automatic
+        // These tests look at HTTP2Connection's child channels.
+        config._http2StreamMode = .childChannels
         let factory = HTTPConnectionPool.ConnectionFactory(
             key: .init(request),
             tlsConfiguration: tlsConfiguration,
@@ -457,6 +459,8 @@ final class TestConnectionCreator {
         tlsConfiguration.certificateVerification = .none
         var config = HTTPClient.Configuration()
         config.httpVersion = .automatic
+        // These tests look at HTTP2Connection's child channels.
+        config._http2StreamMode = .childChannels
         let factory = HTTPConnectionPool.ConnectionFactory(
             key: .init(request),
             tlsConfiguration: tlsConfiguration,
