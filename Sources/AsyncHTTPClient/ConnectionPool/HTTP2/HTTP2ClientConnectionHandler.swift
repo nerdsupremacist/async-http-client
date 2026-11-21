@@ -15,14 +15,16 @@
 import NIOCore
 import NIOHPACK
 import NIOHTTP1
-import NIOHTTP2
+@_spi(Spike) import NIOHTTP2
 
 /// Runs every request of one HTTP/2 client connection as a stream on the connection channel, with
 /// no child channel per stream.
 ///
-/// Sits last in the pipeline, after `HTTP2IdleHandler`, behind a `NIOHTTP2Handler` that has no
-/// multiplexer. It owns stream IDs, all inbound WINDOW_UPDATEs and per-stream write backpressure.
-/// Event loop only.
+/// Sits last in the pipeline, right behind a `NIOHTTP2Handler` whose frame consumer it is (spike):
+/// frames, stream events and processed frames arrive as typed calls, writes go straight into the
+/// `NIOHTTP2Handler`, and the pipeline only carries lifecycle events. It also runs what
+/// `HTTP2IdleHandler` did. It owns stream IDs, all inbound WINDOW_UPDATEs and per-stream write
+/// backpressure. Event loop only.
 ///
 /// Re-entrancy rule: a call out (to the request, or `context.write`, which can fire nio-http2 events
 /// synchronously) may remove the stream, so code after a call out checks `stream.isActive`.
@@ -37,6 +39,8 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
     let eventLoop: any EventLoop
 
     private var context: ChannelHandlerContext?
+    private var outbound: NIOHTTP2Handler._ConsumerOutbound?
+    private var idle: Idle?
     private var streams: [HTTP2StreamID: HTTP2ClientStream] = [:]
     private var nextStreamID: Int32 = 1
     private var connectionWindow = HTTP2InboundWindow(targetSize: HTTP2ClientConnectionHandler.targetWindowSize)
@@ -45,6 +49,10 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
     private var readScratch: [HTTP2ClientStream] = []
     private var streamsWithHeldWrites: [HTTP2ClientStream] = []
     private var scratch: [HTTP2ClientStream] = []
+    /// Recorded by `_processedFrame`, acted on at the end of the batch: nio-http2 calls it before
+    /// it writes the frame, so writing from inside it could reorder frames.
+    private var processedFrames: [ProcessedFrame] = []
+    private var processedScratch: [ProcessedFrame] = []
     /// Set by a GOAWAY frame; streams above it that nio-http2 didn't close are failed at read complete.
     private var goAwayLastStreamID: HTTP2StreamID?
 
@@ -61,6 +69,34 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
 
     var openStreamCount: Int {
         self.streams.count
+    }
+
+    /// Before the handler is added: the idle handler's job, fed by typed calls instead of a hop.
+    func configureIdle(delegate: HTTP2Connection, maximumUses: Int?) {
+        self.idle = Idle(machine: .init(maximumUses: maximumUses), delegate: delegate)
+    }
+
+    func shutdownRequested() {
+        self.eventLoop.assertInEventLoop()
+        self.runIdle { $0.closeEventReceived() }
+    }
+
+    private func runIdle(_ body: (inout HTTP2IdleHandler<HTTP2Connection>.StateMachine) -> IdleAction) {
+        guard self.idle != nil else { return }
+        let action = body(&self.idle!.machine)
+        guard let delegate = self.idle?.delegate else { return }
+        switch action {
+        case .nothing:
+            break
+        case .notifyConnectionNewMaxStreamsSettings(let maxStreams):
+            delegate.http2SettingsReceived(maxStreams: maxStreams)
+        case .notifyConnectionStreamClosed(let currentlyAvailable):
+            delegate.http2StreamClosed(availableStreams: currentlyAvailable)
+        case .notifyConnectionGoAwayReceived:
+            delegate.http2GoAwayReceived()
+        case .close:
+            self.context?.close(mode: .all, promise: nil)
+        }
     }
 
     func executeRequest(_ request: any HTTPExecutableRequest) {
@@ -109,19 +145,42 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
     func handlerAdded(context: ChannelHandlerContext) {
         self.context = context
         self.parentIsWritable = context.channel.isWritable
+        if context.channel.isActive {
+            self.idle?.machine.channelActive()
+        }
     }
 
     func handlerRemoved(context: ChannelHandlerContext) {
         self.context = nil
+        self.idle = nil
     }
 
-    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        let frame = self.unwrapInboundIn(data)
+    func channelActive(context: ChannelHandlerContext) {
+        self.idle?.machine.channelActive()
+        context.fireChannelActive()
+    }
+
+    func _attach(_ outbound: NIOHTTP2Handler._ConsumerOutbound) {
+        self.outbound = outbound
+    }
+
+    func _detach() {
+        self.outbound = nil
+    }
+
+    func _receivedFrame(_ frame: HTTP2Frame) {
         self.isReading = true
 
-        if case .goAway(let lastStreamID, _, _) = frame.payload {
+        switch frame.payload {
+        case .goAway(let lastStreamID, _, _):
+            self.runIdle { $0.goAwayReceived() }
             self.goAwayLastStreamID = lastStreamID
             return
+        case .settings(.settings(let settings)):
+            self.runIdle { $0.settingsReceived(settings) }
+            return
+        default:
+            break
         }
         guard frame.streamID != .rootStream, let stream = self.streams[frame.streamID] else {
             return
@@ -175,38 +234,68 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
         context.fireChannelReadComplete()
     }
 
-    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
-        switch event {
-        case let event as StreamClosedEvent:
-            if let stream = self.streams[event.streamID] {
-                self.streamClosed(stream, reason: event.reason)
-            }
+    func _streamCreated(_ event: NIOHTTP2StreamCreatedEvent) {
+        self.runIdle { $0.streamCreated() }
+    }
 
-        case let event as NIOHTTP2WindowUpdatedEvent:
-            guard let size = event.inboundWindowSize else { break }
-            if event.streamID == .rootStream {
-                if let increment = self.connectionWindow.newWindowSize(size) {
-                    self.withBatch { self.writeWindowUpdate(.rootStream, increment: increment) }
-                }
-            } else if let stream = self.streams[event.streamID],
-                let increment = stream.inboundWindow.newWindowSize(size)
-            {
-                self.withBatch { self.writeWindowUpdate(stream.id, increment: increment) }
-            }
-
-        case let event as NIOHTTP2BulkStreamWindowChangeEvent:
-            self.withBatch {
-                self.forEachStream { stream in
-                    if let increment = stream.inboundWindow.initialWindowSizeChanged(delta: event.delta) {
-                        self.writeWindowUpdate(stream.id, increment: increment)
-                    }
-                }
-            }
-
-        default:
-            break
+    func _streamClosed(_ event: StreamClosedEvent) {
+        // The idle handler used to see the event first.
+        self.runIdle { $0.streamClosed() }
+        if let stream = self.streams[event.streamID] {
+            self.streamClosed(stream, reason: event.reason)
         }
-        context.fireUserInboundEventTriggered(event)
+    }
+
+    func _streamWindowUpdated(_ event: NIOHTTP2WindowUpdatedEvent) {
+        guard let size = event.inboundWindowSize else { return }
+        if event.streamID == .rootStream {
+            if let increment = self.connectionWindow.newWindowSize(size) {
+                self.withBatch { self.writeWindowUpdate(.rootStream, increment: increment) }
+            }
+        } else if let stream = self.streams[event.streamID],
+            let increment = stream.inboundWindow.newWindowSize(size)
+        {
+            self.withBatch { self.writeWindowUpdate(stream.id, increment: increment) }
+        }
+    }
+
+    func _initialStreamWindowChanged(_ event: NIOHTTP2BulkStreamWindowChangeEvent) {
+        self.withBatch {
+            self.forEachStream { stream in
+                if let increment = stream.inboundWindow.initialWindowSizeChanged(delta: event.delta) {
+                    self.writeWindowUpdate(stream.id, increment: increment)
+                }
+            }
+        }
+    }
+
+    func _streamError(streamID: HTTP2StreamID, error: any Error) {
+        guard let stream = self.streams[streamID] else { return }
+        self.withBatch {
+            self.run(stream.machine.errorHappened(error), stream)
+        }
+    }
+
+    /// Replaces E1's write promises: DATA bytes leave the watermarks, and the request's END means
+    /// `requestBodyStreamSent` ("handed to the encoder", not "written to the socket").
+    func _processedFrame(_ frame: HTTP2Frame) {
+        let bytes: Int
+        let endStream: Bool
+        switch frame.payload {
+        case .data(let data):
+            endStream = data.endStream
+            bytes = endStream ? 0 : data.data.readableBytes
+        case .headers(let headers):
+            endStream = headers.endStream
+            bytes = 0
+        default:
+            return
+        }
+        guard bytes > 0 || endStream, let stream = self.streams[frame.streamID] else { return }
+        // A request without a body ends with its HEADERS, which isn't a body end.
+        let bodyEnded = endStream && stream.request.requestFramingMetadata.body.expectedLength != 0
+        guard bytes > 0 || bodyEnded else { return }
+        self.processedFrames.append(ProcessedFrame(stream: stream, bytes: bytes, bodyEnded: bodyEnded))
     }
 
     func channelWritabilityChanged(context: ChannelHandlerContext) {
@@ -236,6 +325,7 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
     }
 
     func channelInactive(context: ChannelHandlerContext) {
+        self.idle?.machine.channelInactive()
         self.isInactive = true
         self.isReading = false
         self.withBatch {
@@ -334,12 +424,8 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
 
         case .sendRequestEnd(let trailers, let writePromise, _):
             // The final action is HTTP/1 semantics; an h2 stream ends after every request anyway.
-            // A caller's promise may belong to another event loop, so the callback is Sendable.
-            let promise = writePromise ?? self.eventLoop.makePromise(of: Void.self)
-            promise.futureResult.whenSuccess {
-                request.requestBodyStreamSent()
-            }
-            self.sendRequestEnd(trailers, promise: promise, stream)
+            // `requestBodyStreamSent` comes from `_processedFrame`, so no promise of our own.
+            self.sendRequestEnd(trailers, promise: writePromise, stream)
 
         case .read:
             self.read0(stream)
@@ -419,7 +505,7 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
         }
     }
 
-    private func sendRequestEnd(_ trailers: HTTPHeaders?, promise: EventLoopPromise<Void>, _ stream: HTTP2ClientStream)
+    private func sendRequestEnd(_ trailers: HTTPHeaders?, promise: EventLoopPromise<Void>?, _ stream: HTTP2ClientStream)
     {
         let held = stream.heldWrite.take()
         stream.localEnded = true
@@ -470,23 +556,13 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
         }
     }
 
-    /// Writes the held frame of a stream that isn't ending yet. DATA gets a promise so its bytes
-    /// count against the watermarks until they're written, like the legacy child channel.
+    /// Writes the held frame of a stream that isn't ending yet. DATA bytes count against the
+    /// watermarks until `_processedFrame` reports them.
     private func releaseHeldWrite(_ stream: HTTP2ClientStream) {
         guard let held = stream.heldWrite.take() else { return }
         switch held.payload {
-        case .data(let data):
-            let size = data.data.readableBytes
-            // Our own promise, on our loop: a caller's may belong to another event loop.
-            let promise = self.eventLoop.makePromise(of: Void.self)
-            if let callerPromise = held.promise {
-                promise.futureResult.cascade(to: callerPromise)
-            }
-            promise.futureResult.assumeIsolated().whenComplete { _ in
-                guard stream.isActive, let newValue = stream.writability.bytesWritten(size) else { return }
-                self.withBatch { self.writabilityChanged(stream, to: newValue) }
-            }
-            self.write(HTTP2Frame(streamID: stream.id, payload: held.payload), promise: promise)
+        case .data:
+            self.write(HTTP2Frame(streamID: stream.id, payload: held.payload), promise: held.promise)
         default:
             stream.headersWritten = true
             self.write(HTTP2Frame(streamID: stream.id, payload: held.payload), promise: held.promise)
@@ -498,12 +574,12 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
     }
 
     private func write(_ frame: HTTP2Frame, promise: EventLoopPromise<Void>?) {
-        guard let context = self.context else {
+        guard let outbound = self.outbound else {
             promise?.fail(HTTPClientError.cancelled)
             return
         }
         self.needsFlush = true
-        context.write(self.wrapOutboundOut(frame), promise: promise)
+        outbound.write(frame, promise: promise)
     }
 
     // Batching and flushing.
@@ -514,9 +590,10 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
         self.batchDepth += 1
         body()
         if self.batchDepth == 1 {
-            // A flush can complete write promises synchronously, and their callbacks can write
-            // again, so loop until nothing is held or unflushed.
+            // A flush reports processed frames (and can complete write promises) synchronously,
+            // and acting on them can write again, so loop until nothing is pending.
             while true {
+                self.drainProcessedFrames()
                 var index = 0
                 while index < self.streamsWithHeldWrites.count {
                     let stream = self.streamsWithHeldWrites[index]
@@ -528,15 +605,37 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
                 }
                 self.streamsWithHeldWrites.removeAll(keepingCapacity: true)
 
-                guard self.needsFlush, !self.isReading, let context = self.context else { break }
-                self.needsFlush = false
-                context.flush()
-                if self.streamsWithHeldWrites.isEmpty && !self.needsFlush {
+                if self.needsFlush, !self.isReading, let outbound = self.outbound {
+                    self.needsFlush = false
+                    outbound.flush()
+                }
+                if self.processedFrames.isEmpty && self.streamsWithHeldWrites.isEmpty
+                    && (!self.needsFlush || self.isReading || self.outbound == nil)
+                {
                     break
                 }
             }
         }
         self.batchDepth -= 1
+    }
+
+    private func drainProcessedFrames() {
+        guard !self.processedFrames.isEmpty else { return }
+        swap(&self.processedScratch, &self.processedFrames)
+        var index = 0
+        while index < self.processedScratch.count {
+            let processed = self.processedScratch[index]
+            index += 1
+            let stream = processed.stream
+            guard stream.isActive else { continue }
+            if processed.bytes > 0, let newValue = stream.writability.bytesWritten(processed.bytes) {
+                self.writabilityChanged(stream, to: newValue)
+            }
+            if processed.bodyEnded, stream.isActive {
+                stream.request.requestBodyStreamSent()
+            }
+        }
+        self.processedScratch.removeAll(keepingCapacity: true)
     }
 
     // Reading.
@@ -660,6 +759,23 @@ final class HTTP2ClientConnectionHandler: ChannelInboundHandler {
 
 @available(*, unavailable)
 extension HTTP2ClientConnectionHandler: Sendable {}
+
+extension HTTP2ClientConnectionHandler: _HTTP2FrameConsumer {}
+
+extension HTTP2ClientConnectionHandler {
+    typealias IdleAction = HTTP2IdleHandler<HTTP2Connection>.StateMachine.Action
+
+    struct Idle {
+        var machine: HTTP2IdleHandler<HTTP2Connection>.StateMachine
+        let delegate: HTTP2Connection
+    }
+
+    struct ProcessedFrame {
+        let stream: HTTP2ClientStream
+        let bytes: Int
+        let bodyEnded: Bool
+    }
+}
 
 extension HTTP2ClientConnectionHandler {
     /// A request's handle on its stream: 3 words (the loop and the stream), so it fits an

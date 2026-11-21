@@ -14,7 +14,7 @@
 
 import Logging
 import NIOCore
-import NIOHTTP2
+@_spi(Spike) import NIOHTTP2
 import NIOHTTPCompression
 
 protocol HTTP2ConnectionDelegate: Sendable {
@@ -266,30 +266,35 @@ final class HTTP2Connection {
             // can be scheduled on this connection.
             let sync = self.channel.pipeline.syncOperations
 
-            let http2Handler = NIOHTTP2Handler(mode: .client, initialSettings: Self.defaultSettings)
-            let maximumUses: Int?
-            switch self.streamDriver {
-            case .childChannels:
-                maximumUses = self.maximumConnectionUses
-            case .connectionHandler:
-                // Retire the connection before odd stream IDs run out.
-                maximumUses = min(
-                    self.maximumConnectionUses ?? .max,
-                    HTTP2ClientConnectionHandler.maximumStreamCount
-                )
-            }
-            let idleHandler = HTTP2IdleHandler(
-                delegate: self,
-                logger: self.logger,
-                maximumConnectionUses: maximumUses
-            )
-
-            try sync.addHandler(http2Handler, position: .last)
-            try sync.addHandler(idleHandler, position: .last)
             switch self.streamDriver {
             case .childChannels(let multiplexer):
+                let http2Handler = NIOHTTP2Handler(mode: .client, initialSettings: Self.defaultSettings)
+                let idleHandler = HTTP2IdleHandler(
+                    delegate: self,
+                    logger: self.logger,
+                    maximumConnectionUses: self.maximumConnectionUses
+                )
+                try sync.addHandler(http2Handler, position: .last)
+                try sync.addHandler(idleHandler, position: .last)
                 try sync.addHandler(multiplexer, position: .last)
+
             case .connectionHandler(let handler):
+                // Spike: the handler is nio-http2's frame consumer and runs the idle state machine
+                // itself, so no idle handler sits in between.
+                handler.configureIdle(
+                    delegate: self,
+                    // Retire the connection before odd stream IDs run out.
+                    maximumUses: min(
+                        self.maximumConnectionUses ?? .max,
+                        HTTP2ClientConnectionHandler.maximumStreamCount
+                    )
+                )
+                let http2Handler = NIOHTTP2Handler(
+                    mode: .client,
+                    initialSettings: Self.defaultSettings,
+                    consumer: handler
+                )
+                try sync.addHandler(http2Handler, position: .last)
                 try sync.addHandler(handler, position: .last)
             }
         } catch {
@@ -397,7 +402,12 @@ final class HTTP2Connection {
 
             // inform the idle connection handler, that connection should be closed, once all streams
             // are closed.
-            self.channel.triggerUserOutboundEvent(HTTPConnectionEvent.shutdownRequested, promise: nil)
+            switch self.streamDriver {
+            case .childChannels:
+                self.channel.triggerUserOutboundEvent(HTTPConnectionEvent.shutdownRequested, promise: nil)
+            case .connectionHandler(let handler):
+                handler.shutdownRequested()
+            }
 
         case .closed, .closing:
             // we are already closing/closed and we need to tolerate this
