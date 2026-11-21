@@ -126,7 +126,7 @@ extension HTTPResponseHead {
     }
 }
 
-/// Turns the HEADERS and DATA frames of one client stream into HTTP/1 response parts, like
+/// Turns the inbound parts of one client stream into HTTP/1 response parts, like
 /// `HTTP2FramePayloadToHTTP1ClientCodec.channelRead`.
 struct HTTP2ClientResponseDecoder {
     private enum PreviousHeaders {
@@ -144,47 +144,40 @@ struct HTTP2ClientResponseDecoder {
     }
 
     mutating func decode(
-        _ payload: HTTP2Frame.FramePayload
+        _ part: NIOHTTP2InboundPart
     ) throws -> (first: HTTPClientResponsePart?, second: HTTPClientResponsePart?) {
-        switch payload {
-        case .headers(let content):
+        switch part {
+        case .headers(let headers, let endStream):
             switch self.previous {
             case .none, .informational:
-                if try content.headers.http2ClientIsInformationalResponse() {
+                if try headers.http2ClientIsInformationalResponse() {
                     self.previous = .informational
-                    return (.head(try HTTPResponseHead(http2ClientHeaderBlock: content.headers)), nil)
+                    return (.head(try HTTPResponseHead(http2ClientHeaderBlock: headers)), nil)
                 }
                 self.previous = .final
                 let head = try HTTPResponseHead(
-                    http2ClientHeaderBlock: content.headers,
+                    http2ClientHeaderBlock: headers,
                     requestMethod: self.requestMethod,
-                    endStream: content.endStream
+                    endStream: endStream
                 )
-                return (.head(head), content.endStream ? .end(nil) : nil)
+                return (.head(head), endStream ? .end(nil) : nil)
 
             case .final:
                 self.previous = .trailers
-                return (.end(HTTPHeaders(http2ClientRegularHeadersFrom: content.headers)), nil)
+                return (.end(HTTPHeaders(http2ClientRegularHeadersFrom: headers)), nil)
 
             case .trailers:
                 preconditionFailure("Sending too many header blocks.")
             }
 
-        case .data(let content):
-            guard case .byteBuffer(let buffer) = content.data else {
-                preconditionFailure("Received DATA frame with non-bytebuffer IOData")
-            }
-            if content.endStream {
+        case .data(let buffer, let endStream):
+            if endStream {
                 if buffer.readableBytes == 0 {
                     return (.end(nil), nil)
                 }
                 return (.body(buffer), .end(nil))
             }
             return (.body(buffer), nil)
-
-        case .alternativeService, .rstStream, .priority, .windowUpdate, .settings, .pushPromise, .ping, .goAway,
-            .origin:
-            return (nil, nil)
         }
     }
 }

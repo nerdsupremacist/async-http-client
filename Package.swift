@@ -47,7 +47,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.100.0"),
         .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.30.0"),
-        .package(url: "https://github.com/nerdsupremacist/swift-nio-http2.git", revision: "bf446775a1683f5dc13240f56de2f9c55c299431"),
+        .package(url: "https://github.com/nerdsupremacist/swift-nio-http2.git", revision: "c319d0bd588794d5bed874b80c4f759eab0f70e4"),
         .package(url: "https://github.com/apple/swift-nio-extras.git", from: "1.26.0"),
         .package(url: "https://github.com/apple/swift-nio-transport-services.git", from: "1.24.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.7.1"),
