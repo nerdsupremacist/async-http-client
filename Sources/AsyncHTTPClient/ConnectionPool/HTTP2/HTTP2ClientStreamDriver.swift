@@ -144,6 +144,11 @@ final class HTTP2ClientStreamDriver {
             }
         }
 
+        if connectionEvents.contains(.closed) {
+            // Before the streams' closes: like the idle handler's channelInactive, so the final closes don't report
+            // free capacity on a dying connection.
+            self.idle.channelInactive()
+        }
         if connectionEvents.contains(.settingsChanged) {
             self.idle.channelActive()
             let maxStreams = streams.remoteMaxConcurrentStreams ?? 100
@@ -166,7 +171,6 @@ final class HTTP2ClientStreamDriver {
         self.touchedScratch.removeAll(keepingCapacity: true)
 
         if connectionEvents.contains(.closed) {
-            self.idle.channelInactive()
             self.delegate = nil
         }
     }
@@ -371,25 +375,16 @@ final class HTTP2ClientStreamDriver {
     }
 
     private func sendBodyPart(_ data: IOData, promise: EventLoopPromise<Void>?, _ stream: HTTP2ClientStream) {
-        guard case .byteBuffer(let buffer) = data else {
-            // File regions need a channel write; the consumer path takes bytes only (prototype gap).
-            promise?.fail(HTTPClientError.requestStreamCancelled)
-            self.run(stream.machine.errorHappened(HTTPClientError.requestStreamCancelled), stream)
-            return
-        }
-        let writableBytes = self.withStream(stream) { nioStream in
-            do {
-                try nioStream.writeData(buffer)
-            } catch {
-                promise?.fail(error)
-                return 1
-            }
+        // Promises are completed after the access: their callbacks may write to this stream again.
+        // nil: stale stream or the write failed; otherwise the bytes still writable.
+        let writableBytes: Int?? = self.withStream(stream) { nioStream -> Int? in
+            guard (try? nioStream.writeData(data)) != nil else { return nil }
             if let promise {
                 nioStream.completeWhenWritten(promise)
             }
             return nioStream.writableBytes
         }
-        guard let writableBytes else {
+        guard let writableBytes = writableBytes ?? nil else {
             promise?.fail(HTTPClientError.requestStreamCancelled)
             return
         }
@@ -399,22 +394,23 @@ final class HTTP2ClientStreamDriver {
         }
     }
 
-    private func sendRequestEnd(_ trailers: HTTPHeaders?, promise: EventLoopPromise<Void>?, _ stream: HTTP2ClientStream)
-    {
+    private func sendRequestEnd(_ trailers: HTTPHeaders?, promise: EventLoopPromise<Void>?, _ stream: HTTP2ClientStream) {
         stream.localEnded = true
         stream.awaitingBodySent = true
-        let written: Void? = self.withStream(stream) { nioStream in
-            do {
-                try nioStream.writeEnd(trailers: trailers.map { HPACKHeaders(http2ClientTrailers: $0) })
-            } catch {
-                promise?.fail(error)
-                return
-            }
+        let written: Bool? = self.withStream(stream) { nioStream in
+            // Attached before the end, so it completes with the END frame's socket write.
             if let promise {
                 nioStream.completeWhenWritten(promise)
             }
+            do {
+                try nioStream.writeEnd(trailers: trailers.map { HPACKHeaders(http2ClientTrailers: $0) })
+                return true
+            } catch {
+                return false
+            }
         }
         if written == nil {
+            // Stale stream: the promise never reached nio-http2.
             promise?.fail(HTTPClientError.requestStreamCancelled)
         }
     }
@@ -496,6 +492,8 @@ final class HTTP2ClientStreamDriver {
                 ),
                 stream
             )
+        case .writeFailed(let error):
+            self.run(stream.machine.errorHappened(error), stream)
         case .ended, .connectionClosed, .none:
             self.run(stream.machine.channelInactive(), stream)
         }
