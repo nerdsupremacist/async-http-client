@@ -38,7 +38,7 @@ final class HTTP2Connection {
     enum StreamMode: Hashable, Sendable {
         /// A child channel and pipeline per request, via `HTTP2StreamMultiplexer`.
         case childChannels
-        /// Every request is an entry in one `HTTP2ClientConnectionHandler`.
+        /// Every request is a stream of nio-http2's consumer mode, run by one `HTTP2ClientStreamDriver`.
         case connectionHandler
 
         /// Child channels whenever a feature needs a stream `Channel` (the stream debug
@@ -58,7 +58,7 @@ final class HTTP2Connection {
 
     private enum StreamDriver {
         case childChannels(HTTP2StreamMultiplexer)
-        case connectionHandler(HTTP2ClientConnectionHandler)
+        case connectionHandler(HTTP2ClientStreamDriver)
     }
 
     private let streamDriver: StreamDriver
@@ -150,7 +150,7 @@ final class HTTP2Connection {
                 )
             )
         case .connectionHandler:
-            self.streamDriver = .connectionHandler(HTTP2ClientConnectionHandler(eventLoop: channel.eventLoop))
+            self.streamDriver = .connectionHandler(HTTP2ClientStreamDriver(channel: channel))
         }
         self.delegate = delegate
         self.state = .initialized
@@ -266,31 +266,27 @@ final class HTTP2Connection {
             // can be scheduled on this connection.
             let sync = self.channel.pipeline.syncOperations
 
-            let http2Handler = NIOHTTP2Handler(mode: .client, initialSettings: Self.defaultSettings)
-            let maximumUses: Int?
-            switch self.streamDriver {
-            case .childChannels:
-                maximumUses = self.maximumConnectionUses
-            case .connectionHandler:
-                // Retire the connection before odd stream IDs run out.
-                maximumUses = min(
-                    self.maximumConnectionUses ?? .max,
-                    HTTP2ClientConnectionHandler.maximumStreamCount
-                )
-            }
-            let idleHandler = HTTP2IdleHandler(
-                delegate: self,
-                logger: self.logger,
-                maximumConnectionUses: maximumUses
-            )
-
-            try sync.addHandler(http2Handler, position: .last)
-            try sync.addHandler(idleHandler, position: .last)
             switch self.streamDriver {
             case .childChannels(let multiplexer):
+                let http2Handler = NIOHTTP2Handler(mode: .client, initialSettings: Self.defaultSettings)
+                let idleHandler = HTTP2IdleHandler(
+                    delegate: self,
+                    logger: self.logger,
+                    maximumConnectionUses: self.maximumConnectionUses
+                )
+                try sync.addHandler(http2Handler, position: .last)
+                try sync.addHandler(idleHandler, position: .last)
                 try sync.addHandler(multiplexer, position: .last)
-            case .connectionHandler(let handler):
-                try sync.addHandler(handler, position: .last)
+
+            case .connectionHandler(let driver):
+                // nio-http2's consumer mode: the driver runs the idle state machine itself, so no idle handler.
+                try driver.start(
+                    on: sync,
+                    initialSettings: Self.defaultSettings,
+                    delegate: self,
+                    // Retire the connection before odd stream IDs run out.
+                    maximumUses: min(self.maximumConnectionUses ?? .max, HTTP2ClientStreamDriver.maximumStreamCount)
+                )
             }
         } catch {
             self.channel.close(mode: .all, promise: nil)
@@ -310,8 +306,8 @@ final class HTTP2Connection {
         case .active:
             let multiplexer: HTTP2StreamMultiplexer
             switch self.streamDriver {
-            case .connectionHandler(let handler):
-                handler.executeRequest(request)
+            case .connectionHandler(let driver):
+                driver.executeRequest(request)
                 return
             case .childChannels(let childMultiplexer):
                 multiplexer = childMultiplexer
@@ -391,13 +387,18 @@ final class HTTP2Connection {
                 for box in self.openStreams {
                     box.channel.triggerUserOutboundEvent(HTTPConnectionEvent.shutdownRequested, promise: nil)
                 }
-            case .connectionHandler(let handler):
-                handler.cancelAllStreams()
+            case .connectionHandler(let driver):
+                driver.cancelAllStreams()
             }
 
             // inform the idle connection handler, that connection should be closed, once all streams
             // are closed.
-            self.channel.triggerUserOutboundEvent(HTTPConnectionEvent.shutdownRequested, promise: nil)
+            switch self.streamDriver {
+            case .childChannels:
+                self.channel.triggerUserOutboundEvent(HTTPConnectionEvent.shutdownRequested, promise: nil)
+            case .connectionHandler(let driver):
+                driver.shutdownRequested()
+            }
 
         case .closed, .closing:
             // we are already closing/closed and we need to tolerate this
