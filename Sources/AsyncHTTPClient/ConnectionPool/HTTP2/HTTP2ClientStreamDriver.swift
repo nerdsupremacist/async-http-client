@@ -133,6 +133,8 @@ final class HTTP2ClientStreamDriver {
             let events = stream.events
             if events.contains(.closed) || state.unsatisfiedRead {
                 Self.takeParts(&stream, into: state)
+            } else if events.contains(.readable) {
+                state.partsInSlot = true
             }
             state.pendingEvents.formUnion(events)
             if events.contains(.closed) {
@@ -179,6 +181,7 @@ final class HTTP2ClientStreamDriver {
         while let part = stream.nextInboundPart() {
             state.pendingReads.append(part)
         }
+        state.partsInSlot = false
     }
 
     private func handleEvents(_ stream: HTTP2ClientStream) {
@@ -426,7 +429,8 @@ final class HTTP2ClientStreamDriver {
     private func read0(_ stream: HTTP2ClientStream) {
         guard !stream.unsatisfiedRead else { return }
         stream.unsatisfiedRead = true
-        if stream.pendingReads.isEmpty {
+        // Only when a visit left parts behind: otherwise the next visit brings them, and the access is saved.
+        if stream.pendingReads.isEmpty, stream.partsInSlot {
             _ = self.withStream(stream) { nioStream in Self.takeParts(&nioStream, into: stream) }
         }
         if !stream.pendingReads.isEmpty {

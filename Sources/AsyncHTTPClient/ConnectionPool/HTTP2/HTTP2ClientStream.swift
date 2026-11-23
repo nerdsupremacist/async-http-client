@@ -42,6 +42,8 @@ final class HTTP2ClientStream {
 
     /// The stream wants to read: parts are taken from nio-http2 right away. Mirrors `HTTP2StreamChannel.unsatisfiedRead`.
     var unsatisfiedRead = false
+    /// A visit left parts in nio-http2's slot (the stream wasn't reading): `read` takes them with an access.
+    var partsInSlot = false
     var isWritable = true
     /// `sendRequestEnd` ran: the END's `.localEndSent` means `requestBodyStreamSent`.
     var awaitingBodySent = false
