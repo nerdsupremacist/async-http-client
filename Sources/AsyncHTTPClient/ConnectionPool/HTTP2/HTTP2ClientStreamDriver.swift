@@ -187,6 +187,12 @@ final class HTTP2ClientStreamDriver {
     private func handleEvents(_ stream: HTTP2ClientStream) {
         let events = stream.pendingEvents
         stream.pendingEvents = []
+        // `.localEndSent` arrives with the stream's next visit, often its last: report it before the close delivers
+        // the response end.
+        if events.contains(.localEndSent), stream.awaitingBodySent, stream.isActive {
+            stream.awaitingBodySent = false
+            stream.request.requestBodyStreamSent()
+        }
         if events.contains(.closed) {
             stream.closedByNIO = true
             if stream.countedByIdle {
@@ -201,10 +207,6 @@ final class HTTP2ClientStreamDriver {
         if events.contains(.writable), !stream.isWritable {
             stream.isWritable = true
             self.run(stream.machine.writabilityChanged(writable: true), stream)
-        }
-        if events.contains(.localEndSent), stream.awaitingBodySent, stream.isActive {
-            stream.awaitingBodySent = false
-            stream.request.requestBodyStreamSent()
         }
         if events.contains(.readable) {
             self.tryToRead(stream)
